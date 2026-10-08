@@ -46,6 +46,8 @@ from band.client.streaming import (
 from band.core.protocols import (
     GENERIC_PROVIDER_FAILURE_MESSAGE,
     TURN_FAILURE_PROVIDER,
+    TurnDeferred,
+    TurnDeferredCancellation,
     TurnResultAlreadyReported,
 )
 from band.core.types import is_contact_hub_turn, metadata_to_dict
@@ -1139,8 +1141,17 @@ class ExecutionContext:
                     await self._wait_until_resync_complete()
                     continue
 
-                if await self._process_event(event) is False:
-                    await self._wait_until_resync_complete()
+                while True:
+                    try:
+                        if await self._process_event(event) is False:
+                            await self._wait_until_resync_complete()
+                        break
+                    except TurnDeferred:
+                        # Local events have no REST delivery for /next to replay.
+                        # Keep their FIFO position until accepted or shut down.
+                        await asyncio.sleep(self.config.idle_resync_seconds)
+                        while self._stopped:
+                            await asyncio.sleep(self.config.idle_resync_seconds)
 
         except asyncio.CancelledError:
             logger.debug("ExecutionContext %s cancelled", self.room_id)
@@ -1611,6 +1622,9 @@ class ExecutionContext:
             logger.debug("Message %s processed successfully", msg_id)
             return BacklogProcessResult.ADVANCED
 
+        except TurnDeferred as e:
+            await self._defer_turn(msg_id, e)
+            return BacklogProcessResult.RETRY_LATER
         except Exception as e:  # noqa: BLE001 -- the turn boundary: logged by _log_turn_error, then marked failed
             _log_turn_error(e, "Error processing backlog message %s", msg_id)
             await self._handle_turn_failure(msg_id, attempts, e)
@@ -1824,9 +1838,13 @@ class ExecutionContext:
                         )
                         cycle_task.result()
                     else:
+                        parent_task = asyncio.current_task()
+                        cancellations = parent_task.cancelling() if parent_task else 0
                         if cycle_task is not None:
                             cycle_task.cancel()
                             await self._drain_cancelled_cycle_task(cycle_task)
+                        if parent_task and parent_task.cancelling() > cancellations:
+                            raise asyncio.CancelledError
                         message = (
                             f"cycle exceeded max_cycle_seconds="
                             f"{self.config.max_cycle_seconds}"
@@ -1841,6 +1859,13 @@ class ExecutionContext:
                         kind = self._take_interrupt_kind()
                         if kind is not None:
                             return await self._abort_cycle(kind, msg_id)
+                        if cycle_task is not None and cycle_task.cancelled():
+                            try:
+                                cycle_task.result()
+                            except TurnDeferredCancellation as deferred:
+                                raise TurnDeferred(str(deferred)) from None
+                            except asyncio.CancelledError:
+                                pass
                         # Replace whatever bare TimeoutError arrived
                         # (asyncio.timeout's own conversion carries no
                         # message) with one mark_failed can show the user,
@@ -1935,6 +1960,9 @@ class ExecutionContext:
             "interrupted" if kind is ControlMode.INTERRUPT else "stopped",
             msg_id,
         )
+        if kind is ControlMode.STOP and not msg_id:
+            # Local events have no platform row to replay when the room resumes.
+            raise TurnDeferred("room stopped before the local event completed")
         return False
 
     async def _process_event(self, event: PlatformEvent) -> bool:
@@ -2044,6 +2072,17 @@ class ExecutionContext:
     def note_turn_failure_reported(self) -> None:
         """Record that the adapter already told the room this turn failed."""
         self._turn_failure_reported = True
+
+    async def _defer_turn(self, msg_id: str, error: TurnDeferred) -> None:
+        """Leave an unaccepted turn retryable without spending its failure budget."""
+        self._retry_tracker.discard_attempt(msg_id)
+        logger.info("Deferring message %s in room %s: %s", msg_id, self.room_id, error)
+        if not await self.link.mark_failed(self.room_id, msg_id, _error_label(error)):
+            logger.warning(
+                "ExecutionContext %s: Failed to defer message %s",
+                self.room_id,
+                msg_id,
+            )
 
     async def _handle_turn_failure(
         self,
@@ -2211,6 +2250,11 @@ class ExecutionContext:
             logger.debug("Event %s processed successfully", event.type)
             return True
 
+        except TurnDeferred as e:
+            if isinstance(event, MessageEvent) and msg_id:
+                await self._defer_turn(msg_id, e)
+                return False
+            raise
         except Exception as e:  # noqa: BLE001 -- the turn boundary: logged by _log_turn_error, then marked failed
             _log_turn_error(e, "Error processing %s", event.type)
             if isinstance(event, MessageEvent) and msg_id:
