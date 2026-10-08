@@ -1,7 +1,7 @@
 """Message-lifecycle REST operations — no WebSocket state involved.
 
 Split out of BandLink: mark_processing/processed/failed, report_activity,
-and the /next + stale-processing REST reads share nothing with WebSocket
+and the /next + paginated backlog REST reads share nothing with WebSocket
 connection or subscription state, only a REST client.
 """
 
@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from typing import Any
 
 from band_rest.core.api_error import ApiError
+from band_rest.types.chat_message import ChatMessage
 from band_rest.types.chat_message_metadata import ChatMessageMetadata
 
 from band.client.rest import DEFAULT_REQUEST_OPTIONS, AsyncRestClient
@@ -23,6 +25,20 @@ logger = logging.getLogger(__name__)
 def _message_metadata(metadata: ChatMessageMetadata | None) -> dict[str, object]:
     """Normalize a Fern-typed message metadata into the plain dict PlatformMessage carries."""
     return metadata_to_dict(metadata, exclude_none=True)
+
+
+def _platform_message(item: ChatMessage, room_id: str) -> PlatformMessage:
+    return PlatformMessage(
+        id=item.id,
+        room_id=item.chat_room_id or room_id,
+        content=item.content,
+        sender_id=item.sender_id,
+        sender_type=item.sender_type,
+        sender_name=item.sender_name or "",
+        message_type=item.message_type,
+        metadata=_message_metadata(item.metadata),
+        created_at=item.inserted_at or datetime.now(UTC),
+    )
 
 
 class MessageLifecycle:
@@ -193,18 +209,7 @@ class MessageLifecycle:
         if response is None or response.data is None:
             return None
 
-        item = response.data
-        return PlatformMessage(
-            id=item.id,
-            room_id=item.chat_room_id or room_id,
-            content=item.content,
-            sender_id=item.sender_id,
-            sender_type=item.sender_type,
-            sender_name=item.sender_name or "",
-            message_type=item.message_type,
-            metadata=_message_metadata(item.metadata),
-            created_at=item.inserted_at or datetime.now(UTC),
-        )
+        return _platform_message(response.data, room_id)
 
     async def get_stale_processing_messages(
         self, rest: AsyncRestClient, room_id: str
@@ -212,52 +217,64 @@ class MessageLifecycle:
         """
         Get messages stuck in 'processing' state for a room.
 
-        Recovery sweep for agent restart: a crash mid-processing leaves
-        messages in 'processing', and the long-running runtime calls this at
-        startup to drain them.
-
-        Redundant for callers already polling ``/next``: it includes
-        stuck-processing messages in its "actionable" set too (excludes only
-        ``processed`` — see ``Chat.get_next_actionable_message`` on the
-        platform side), so the bridge's rehydration nudge and
-        ``OneShotInvoker``'s claim step don't need this method. It exists for
-        callers that want every stuck message up front, not one per room.
+        Listing errors propagate so the runtime can retry startup instead of
+        treating an unavailable recovery sweep as an empty room.
         """
-        try:
-            messages = []
-            page = 1
-            while True:
-                response = await rest.agent_api_messages.list_agent_messages(
-                    chat_id=room_id,
-                    status="processing",
-                    page=page,
-                    request_options=DEFAULT_REQUEST_OPTIONS,
-                )
-                for item in response.data:
-                    messages.append(
-                        PlatformMessage(
-                            id=item.id,
-                            room_id=item.chat_room_id or room_id,
-                            content=item.content,
-                            sender_id=item.sender_id,
-                            sender_type=item.sender_type,
-                            sender_name=item.sender_name or "",
-                            message_type=item.message_type,
-                            metadata=_message_metadata(item.metadata),
-                            created_at=item.inserted_at or datetime.now(UTC),
-                        )
-                    )
+        return await self._list_messages(rest, room_id, status="processing")
 
-                total_pages = response.metadata.total_pages
-                if total_pages is None or page >= total_pages:
-                    break
+    async def get_actionable_messages(
+        self, rest: AsyncRestClient, room_id: str
+    ) -> list[PlatformMessage]:
+        """Snapshot actionable deliveries in authoritative server order.
+
+        Finish every page before the runtime changes delivery statuses: page
+        offsets shift when messages leave the filtered set. A single unfiltered
+        listing also keeps status transitions from hiding older deliveries.
+        """
+        messages: dict[str, PlatformMessage] = {}
+        for message in await self._list_messages(rest, room_id, status=None):
+            messages.setdefault(message.id, message)
+        return list(messages.values())
+
+    async def _list_messages(
+        self,
+        rest: AsyncRestClient,
+        room_id: str,
+        *,
+        status: str | None,
+    ) -> list[PlatformMessage]:
+        messages: list[PlatformMessage] = []
+        page = 1
+        pagination: dict[str, Any] = {"sort_order": "asc"}
+        seen_cursors: set[str] = set()
+        while True:
+            response = await rest.agent_api_messages.list_agent_messages(
+                chat_id=room_id,
+                status=status,
+                **pagination,
+                request_options=DEFAULT_REQUEST_OPTIONS,
+            )
+            messages.extend(_platform_message(item, room_id) for item in response.data)
+
+            cursor = response.metadata.next_cursor
+            if response.metadata.has_more is True and cursor:
+                if cursor in seen_cursors:
+                    raise ValueError("Message listing has no usable pagination cursor")
+                seen_cursors.add(cursor)
+                pagination = {"cursor": cursor, "sort_order": "asc"}
+                continue
+
+            total_pages = response.metadata.total_pages
+            if (
+                "cursor" not in pagination
+                and total_pages is not None
+                and page < total_pages
+            ):
                 page += 1
+                pagination = {"page": page, "sort_order": "asc"}
+                continue
+
+            if response.metadata.has_more is True:
+                raise ValueError("Message listing has no usable pagination cursor")
 
             return messages
-        except Exception as e:  # noqa: BLE001 -- best-effort event emission must not crash the turn/link
-            logger.warning(
-                "Failed to get stale processing messages for room %s: %s",
-                room_id,
-                e,
-            )
-            return []
