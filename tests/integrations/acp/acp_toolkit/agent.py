@@ -391,6 +391,36 @@ class FakeACPAgent:
         self._script.append(_action)
         return self
 
+    def will_call_invalid_mcp_tool(
+        self, tool_call_id: str, tool_name: str, *, arguments: dict[str, Any]
+    ) -> FakeACPAgent:
+        """Consume a real MCP validation error and continue the provider turn."""
+
+        async def action(agent: FakeACPAgent, sid: str) -> None:
+            await agent.emit(
+                sid,
+                start_tool_call(
+                    tool_call_id=tool_call_id,
+                    title=tool_name,
+                    raw_input=arguments,
+                ),
+            )
+            config = agent.mcp_server(sid, "band")
+            async with mcp_session(config.url, BandMCPTransport(config.type)) as client:
+                result = await client.call_tool(tool_name, arguments)
+            assert result.isError, "the MCP boundary must reject these arguments"
+            await agent.emit(
+                sid,
+                update_tool_call(
+                    tool_call_id,
+                    raw_output=result.content,
+                    status="failed",
+                ),
+            )
+
+        self._script.append(action)
+        return self
+
     def will_plan(self, *steps: str) -> FakeACPAgent:
         self._script.append(
             lambda a, sid: a.emit(sid, update_plan([plan_entry(s) for s in steps]))
@@ -447,6 +477,15 @@ class FakeACPAgent:
 
     async def say(self, session_id: str, text: str) -> None:
         await self.emit(session_id, update_agent_message_text(text))
+
+    async def reply(self, session_id: str, content: str) -> None:
+        """Post a room reply the only way a turn can: through the Band MCP tool."""
+        await self.call_mcp_tool(
+            session_id=session_id,
+            server="band",
+            tool_name="band_send_message",
+            arguments={"content": content, "mentions": ["@pat"]},
+        )
 
     async def update_cursor_todos(self, session_id: str, *contents: str) -> None:
         """Push Cursor's ``cursor/update_todos`` extension notification."""

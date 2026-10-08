@@ -25,12 +25,16 @@ from acp import RequestError
 from acp.helpers import start_tool_call, update_tool_call
 from pydantic import BaseModel
 
+from band.adapters.copilot_acp import CopilotACPAdapter
+from band.adapters.cursor_acp import CursorACPAdapter
+from band.adapters.omp_acp import OmpACPAdapter
 from band.core.protocols import TurnDeferred
 from band.core.types import Capability
 from band.integrations.acp.client_adapter import (
     HISTORY_REPLAY_HEADER,
     NEW_MESSAGE_MARKER_PREFIX,
     SYSTEM_UPDATE_PREFIX,
+    ACPClientAdapter,
     SessionInitializer,
 )
 from band.integrations.acp.client_types import ACPClientSessionState
@@ -38,7 +42,8 @@ from band.integrations.mcp import BandMCPBackendStoppedError
 from band.platform.event import MessageEvent
 from band.runtime.execution import BacklogProcessResult, ExecutionContext
 from band.runtime.formatters import build_participants_message
-from band.runtime.tools import BAND_MCP_SERVER_NAME
+from band.runtime.prompts import COMMUNICATION_INSTRUCTIONS
+from band.runtime.tools import BAND_MCP_SERVER_NAME, BandTool
 from band.runtime.types import SessionConfig
 from tests.conftest import make_message_event
 from tests.integrations.acp.acp_toolkit import (
@@ -46,6 +51,7 @@ from tests.integrations.acp.acp_toolkit import (
     acp_adapter,
     fake_agent_config,
     live_line,
+    started_acp_adapter,
 )
 from tests.mcpbackends import backends_created_by
 from tests.mcpclient import (
@@ -117,7 +123,8 @@ async def test_agent_message_relayed_as_room_message(fake_agent) -> None:
     async with acp_adapter(fake_agent) as session:
         reply = await session.send("weather?", room="room-1")
 
-    assert reply.texts == ["The weather is sunny."]
+    assert reply.texts == []
+    assert reply.thoughts == ["The weather is sunny."]
     assert len(fake_agent.prompts) == 1  # the prompt really round-tripped to the agent
 
 
@@ -129,9 +136,11 @@ async def test_session_busy_recovers_over_the_acp_wire_without_a_new_session(
     async def reject_then_reply(agent: FakeACPAgent, session_id: str) -> None:
         if len(agent.prompts) == 1:
             raise RequestError(-32003, "Session is busy", {"reason": "session_busy"})
-        await agent.say(session_id, "Recovered over ACP.")
+        await agent.reply(session_id, "Recovered over ACP.")
 
-    async with acp_adapter(fake_agent) as session:
+    async with acp_adapter(
+        fake_agent, fake_agent_config(inject_band_tools=True)
+    ) as session:
         reply = await session.send("question?", room="room-1")
         original_session = session.session_id("room-1")
         followup = await session.send("another question?", room="room-1")
@@ -160,9 +169,11 @@ async def test_rejected_attempt_cannot_suppress_accepted_reply(fake_agent) -> No
                 update_tool_call("autonomous", status="completed", raw_output="sent"),
             )
             raise RequestError(-32003, "Session is busy", {"reason": "session_busy"})
-        await agent.say(session_id, "The accepted turn's answer.")
+        await agent.reply(session_id, "The accepted turn's answer.")
 
-    async with acp_adapter(fake_agent) as session:
+    async with acp_adapter(
+        fake_agent, fake_agent_config(inject_band_tools=True)
+    ) as session:
         reply = await session.send("question?", room="room-1")
 
     assert reply.texts == ["The accepted turn's answer."]
@@ -184,7 +195,8 @@ async def test_synthetic_contact_delivery_survives_busy_deferral(fake_agent) -> 
     link = make_link_mock()
     link.get_stale_processing_messages = AsyncMock(return_value=[])
     async with acp_adapter(
-        fake_agent, config=fake_agent_config(turn_timeout_s=0.03)
+        fake_agent,
+        config=fake_agent_config(turn_timeout_s=0.03),
     ) as session:
 
         async def deliver(ctx, event):
@@ -220,7 +232,10 @@ async def test_synthetic_contact_delivery_survives_busy_deferral(fake_agent) -> 
                 await deferred.wait()
                 busy = False
                 await delivered.wait()
-            assert session.last_reply.texts == ["Contact update handled."]
+            # Without injected Band tools the accepted turn's narration closes
+            # it as a thought; it is never relayed as a room reply.
+            assert session.last_reply.thoughts == ["Contact update handled."]
+            assert session.last_reply.texts == []
             assert session.last_reply.errors == []
             link.mark_processing.assert_not_awaited()
             link.mark_processed.assert_not_awaited()
@@ -243,7 +258,7 @@ async def test_persistent_session_busy_defers_delivery_without_exhausting_retrie
     async def reject_while_busy(agent: FakeACPAgent, session_id: str) -> None:
         if busy:
             raise RequestError(-32003, "Session is busy", {"reason": "session_busy"})
-        await agent.say(session_id, "Delivery recovered.")
+        await agent.reply(session_id, "Delivery recovered.")
 
     link = make_link_mock()
     link.mark_processing.return_value = True
@@ -261,7 +276,8 @@ async def test_persistent_session_busy_defers_delivery_without_exhausting_retrie
     # deadline. The adapter-deadline variant keeps the 100ms turn timeout.
     turn_timeout_s = 0.4 if max_cycle_seconds is not None else 0.1
     async with acp_adapter(
-        fake_agent, config=fake_agent_config(turn_timeout_s=turn_timeout_s)
+        fake_agent,
+        config=fake_agent_config(turn_timeout_s=turn_timeout_s, inject_band_tools=True),
     ) as session:
 
         async def deliver(ctx: ExecutionContext, event: MessageEvent) -> None:
@@ -324,7 +340,21 @@ async def test_streamed_text_deltas_become_one_message(fake_agent) -> None:
     async with acp_adapter(fake_agent) as session:
         reply = await session.send("weather?")
 
-    assert reply.texts == ["The weather is sunny."]
+    assert reply.texts == []
+    assert reply.thoughts == ["The weather is sunny."]
+
+
+@pytest.mark.asyncio
+async def test_assistant_text_can_be_reported_as_a_thought(fake_agent) -> None:
+    # A closing aside the model wrote outside any Band tool reaches the room as
+    # the agent's thought, not as a reply mentioning (and waking) the sender.
+    fake_agent.will_say("(Waiting on the review; nothing to change.)")
+    config = fake_agent_config()
+    async with acp_adapter(fake_agent, config) as session:
+        reply = await session.send("Correction: it is 585, not 584.")
+
+    assert reply.texts == []
+    assert reply.thoughts == ["(Waiting on the review; nothing to change.)"]
 
 
 @pytest.mark.asyncio
@@ -400,7 +430,8 @@ async def test_injected_tools_never_settle_from_the_stream(fake_agent) -> None:
     ) as session:
         reply = await session.send("question?", room="room-1")
 
-    assert reply.texts == ["The answer is 42."]
+    assert reply.texts == []
+    assert reply.thoughts == ["The answer is 42."]
 
 
 @pytest.mark.asyncio
@@ -412,7 +443,8 @@ async def test_text_relayed_when_band_post_failed(fake_agent) -> None:
     async with acp_adapter(fake_agent) as session:
         reply = await session.send("question?")
 
-    assert reply.texts == ["The answer is 42."]
+    assert reply.texts == []
+    assert reply.thoughts == ["The answer is 42."]
 
 
 @pytest.mark.asyncio
@@ -422,7 +454,8 @@ async def test_text_relayed_alongside_non_posting_tool(fake_agent) -> None:
     async with acp_adapter(fake_agent) as session:
         reply = await session.send("weather?")
 
-    assert reply.texts == ["It's 72F."]
+    assert reply.texts == []
+    assert reply.thoughts == ["It's 72F."]
 
 
 @pytest.mark.asyncio
@@ -616,7 +649,7 @@ async def test_ordinary_tool_permission_granted_without_a_bubble(fake_agent) -> 
 
     assert fake_agent.approved is True  # the round-trip still granted the allow option
     assert reply.permissions == []  # no duplicate permission pair for an ordinary tool
-    assert "done" in reply.texts  # the turn proceeded after approval
+    assert "done" in reply.thoughts  # the turn proceeded after approval
 
 
 @pytest.mark.asyncio
@@ -684,6 +717,7 @@ async def test_intent_titled_send_message_is_not_duplicated_by_text(
         reply = await session.send("please hand off", room="room-1")
 
     assert reply.texts == [answer]
+    assert reply.thoughts == []
 
 
 @pytest.mark.asyncio
@@ -703,7 +737,8 @@ async def test_intent_titled_read_only_tool_keeps_text_reply(
     ) as session:
         reply = await session.send("who is here?", room="room-1")
 
-    assert reply.texts == [answer]
+    assert reply.texts == []
+    assert reply.thoughts == [answer]
 
 
 @pytest.mark.asyncio
@@ -823,7 +858,7 @@ async def test_two_rooms_get_isolated_sessions(fake_agent) -> None:
 
     # Each room created its own ACP session and got its own reply — no cross-talk.
     assert len({s["session_id"] for s in fake_agent.sessions}) == 2
-    assert reply1.texts != reply2.texts
+    assert reply1.thoughts != reply2.thoughts
 
 
 # --- Room-bound Band MCP endpoints ---------------------------------------------
@@ -1109,7 +1144,8 @@ async def test_first_session_busy_deferral_preserves_bootstrap_context(
         assert accepted.index("[System Context]") < replay_boundary(accepted)
     assert "[System Context]" not in followup
     assert REPLAY_HEADER_LINE not in followup
-    assert reply.texts == ["7421."]
+    assert reply.thoughts == ["7421."]
+    assert reply.texts == []
     assert reply.errors == []
 
 
@@ -1180,7 +1216,7 @@ async def test_replay_injected_when_session_load_errors() -> None:
     assert REPLAY_HEADER_LINE in agent.prompt_texts()[0], (
         "an erroring load counts as a miss, so the replay must still fire"
     )
-    assert reply.texts == ["Blue."], "the turn must complete despite the load error"
+    assert reply.thoughts == ["Blue."], "the turn must complete despite the load error"
 
 
 @pytest.mark.asyncio
@@ -1370,7 +1406,8 @@ async def test_codex_call_to_another_servers_same_named_tool_is_not_a_reply(
     async with acp_adapter(fake_agent) as session:
         reply = await session.send("question?")
 
-    assert reply.texts == ["The answer."]
+    assert reply.texts == []
+    assert reply.thoughts == ["The answer."]
     assert reply.tool_call_names == ["other-band_send_message"]
 
 
@@ -1389,7 +1426,7 @@ async def test_cursor_mcp_call_narrates_under_the_name_it_reports_late(
     assert reply.tool_call_names == ["band_list_contacts"]
     assert reply.tool_call_args == [{"chat_id": "c1"}]
     assert reply.tool_result_names == ["band_list_contacts"]
-    assert reply.outline == ["tool_call", "tool_result", "message", "task"]
+    assert reply.outline == ["tool_call", "tool_result", "thought", "task"]
 
 
 @pytest.mark.asyncio
@@ -1494,7 +1531,7 @@ async def test_replay_after_midrun_respawn() -> None:
         )
 
     assert "error" in crashed.outline, "the failed turn must surface an error event"
-    assert reply.texts == ["Blue."], "the respawned turn must complete"
+    assert reply.thoughts == ["Blue."], "the respawned turn must complete"
 
     prompt = agent.prompt_texts()[-1]
     assert (
@@ -1503,3 +1540,69 @@ async def test_replay_after_midrun_respawn() -> None:
     assert prompt.rstrip().endswith("What is my favorite color?"), (
         "the live message must come last so the model answers it, not the transcript"
     )
+
+
+@pytest.mark.parametrize(
+    "adapter_class", [CopilotACPAdapter, CursorACPAdapter, OmpACPAdapter]
+)
+@pytest.mark.parametrize(
+    "selection, expected",
+    [
+        (
+            {
+                "include_tools": {
+                    BandTool.SEND_MESSAGE,
+                    BandTool.NO_REPLY,
+                    BandTool.GET_PARTICIPANTS,
+                }
+            },
+            {BandTool.SEND_MESSAGE, BandTool.NO_REPLY, BandTool.GET_PARTICIPANTS},
+        ),
+        (
+            {
+                "include_categories": {"chat"},
+                "include_tools": {
+                    BandTool.SEND_MESSAGE,
+                    BandTool.NO_REPLY,
+                    BandTool.GET_PARTICIPANTS,
+                },
+                "exclude_tools": {BandTool.SEND_MESSAGE, BandTool.NO_REPLY},
+            },
+            {BandTool.GET_PARTICIPANTS},
+        ),
+    ],
+)
+async def test_acp_wrappers_advertise_filtered_platform_tools(
+    adapter_class: type[ACPClientAdapter],
+    selection: dict[str, Any],
+    expected: set[str],
+) -> None:
+    agent = FakeACPAgent()
+    advertised: set[str] = set()
+
+    @agent.on_prompt
+    async def inspect_tools(peer: FakeACPAgent, session_id: str) -> None:
+        advertised.update(
+            tool.name
+            for tool in await peer.list_mcp_tools(session_id=session_id, server="band")
+        )
+
+    adapter = adapter_class(**selection)
+    async with started_acp_adapter(adapter, agent) as session:
+        await session.send("inspect registered tools")
+    assert advertised == expected
+
+
+@pytest.mark.parametrize("restored", [True, False])
+async def test_acp_mandatory_transport_contract_refreshes_first_prompt(
+    restored: bool,
+) -> None:
+    agent = FakeACPAgent(supports_session_load=True).will_say("native")
+    history = (
+        rehydration_history("old message", session="old-session") if restored else []
+    )
+    async with acp_adapter(
+        agent, fake_agent_config(custom_section="custom instructions")
+    ) as session:
+        await session.send("new message", history=history)
+    assert agent.prompt_texts()[0].count(COMMUNICATION_INSTRUCTIONS) == 1
