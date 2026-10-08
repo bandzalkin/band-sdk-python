@@ -478,6 +478,15 @@ class FakeACPAgent:
     async def say(self, session_id: str, text: str) -> None:
         await self.emit(session_id, update_agent_message_text(text))
 
+    async def reply(self, session_id: str, content: str) -> None:
+        """Post a room reply the only way a turn can: through the Band MCP tool."""
+        await self.call_mcp_tool(
+            session_id=session_id,
+            server="band",
+            tool_name="band_send_message",
+            arguments={"content": content, "mentions": ["@pat"]},
+        )
+
     async def update_cursor_todos(self, session_id: str, *contents: str) -> None:
         """Push Cursor's ``cursor/update_todos`` extension notification."""
         todos = [
