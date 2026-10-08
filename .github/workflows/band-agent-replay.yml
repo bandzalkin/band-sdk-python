@@ -1,0 +1,121 @@
+# Keeps band-agent's SDK patch set current with upstream main.
+# See FORK-CHANGES.md for the patch contract and the manual procedures.
+name: band-agent-replay
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # weekly, Monday 06:17 UTC; band-agent's fork-freshness watches at 07:30
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: band-agent-replay
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: band-ai/band-sdk-python
+  STAGED_BRANCH: band-agent-patches-latest
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: band-agent-patches
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch upstream main --quiet
+          git fetch origin "${STAGED_BRANCH}" --quiet || true
+
+      - name: Replay the patch set onto upstream main
+        id: replay
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          target=$(git rev-parse upstream/main)
+          patches=$(git rev-list --reverse HEAD --not upstream/main)
+          [ -n "$patches" ] || {
+            echo "::error::band-agent-patches carries no fork-only commits"
+            exit 1
+          }
+          git config user.name "band-agent-fork-bot"
+          git config user.email "band-agent-fork-bot@users.noreply.github.com"
+          git checkout -B "$STAGED_BRANCH" "$target"
+          merged=""
+          closed=""
+          while IFS= read -r sha; do
+            [ -n "$sha" ] || continue
+            pr=$(git log -1 --format='%(trailers:key=Upstream-PR,valueonly)' "$sha" | sed -n 's/.*#\([0-9][0-9]*\).*/\1/p' | head -1)
+            if [ -n "$pr" ]; then
+              state=$(gh api "repos/${UPSTREAM}/pulls/${pr}" --jq 'if .merged_at then "merged" else .state end')
+              if [ "$state" = merged ]; then
+                merged="${merged} #${pr}"
+                continue
+              fi
+              [ "$state" = open ] || closed="${closed} #${pr}"
+            fi
+            if ! git cherry-pick --empty=drop "$sha"; then
+              echo "::error::$(git log -1 --format='%h %s' "$sha") no longer applies to upstream main at ${target}; resolve the replay by hand (FORK-CHANGES.md)"
+              exit 1
+            fi
+          done <<< "$patches"
+          changed=true
+          if git show-ref --verify --quiet "refs/remotes/origin/${STAGED_BRANCH}" &&
+             git diff --quiet "origin/${STAGED_BRANCH}" HEAD; then
+            changed=false
+          fi
+          {
+            echo "target=$target"
+            echo "changed=$changed"
+            echo "merged=$merged"
+            echo "closed=$closed"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: astral-sh/setup-uv@v6
+        if: steps.replay.outputs.changed == 'true'
+
+      - name: Validate the replayed SDK
+        if: steps.replay.outputs.changed == 'true'
+        run: |
+          uv sync --all-packages --locked --extra dev
+          uv run --all-packages pre-commit run --all-files
+          uv run --all-packages pytest -q
+
+      # The staged branch is force-pushed every time upstream moves, which would orphan a
+      # commit band-agent pins; the tag keeps every staged revision fetchable by its SHA.
+      - name: Push the staged revision
+        if: steps.replay.outputs.changed == 'true'
+        run: |
+          git push origin "HEAD:refs/tags/staged/$(date -u +%Y-%m-%d)-$(git rev-parse --short=12 HEAD)"
+          git push --force-with-lease origin "HEAD:${STAGED_BRANCH}"
+
+      - name: Summarize
+        env:
+          TARGET: ${{ steps.replay.outputs.target }}
+          CHANGED: ${{ steps.replay.outputs.changed }}
+          MERGED: ${{ steps.replay.outputs.merged }}
+          CLOSED: ${{ steps.replay.outputs.closed }}
+        run: |
+          {
+            echo "## band-agent-replay"
+            if [ "$CHANGED" = true ]; then
+              echo "Staged \`${STAGED_BRANCH}\` at $(git rev-parse HEAD) over upstream ${TARGET}."
+            else
+              echo "\`${STAGED_BRANCH}\` already matches upstream ${TARGET} plus the patch set."
+            fi
+            if [ -n "$MERGED" ]; then
+              echo ""
+              echo "Merged upstream, skipped:${MERGED}. Drop them from band-agent-patches (FORK-CHANGES.md)."
+            fi
+            if [ -n "$CLOSED" ]; then
+              echo ""
+              echo "Closed upstream without merging, still applied:${CLOSED}."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
