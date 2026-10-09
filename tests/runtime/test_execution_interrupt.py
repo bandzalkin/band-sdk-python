@@ -467,17 +467,21 @@ class TestPlatformStoppedRoom:
         assert result == BacklogProcessResult.ADVANCED
         assert handler.completed == ["m1"]
 
-    async def test_refusal_right_after_a_play_is_retried_not_adopted(self, mock_link):
+    @pytest.mark.parametrize("play_again", [False, True], ids=["quiet", "flapping"])
+    async def test_refusal_right_after_a_play_is_retried_not_adopted(
+        self, mock_link, play_again
+    ):
         """A re-claim refused just after a play may come from a platform node
         still serving the cached stop. This process hears any newer stop as a
         control signal, so the refusal must not silence the resumed room: the
-        claim fails and is retried later."""
+        claim fails and is retried later. Plays that keep landing while the
+        claim is refused still get one immediate re-claim, never a tight loop."""
         handler = BlockingHandler(block=False)
         ctx = ExecutionContext("room-123", mock_link, handler, agent_id="agent-123")
-        plays = [True, False]
+        plays = iter([True, play_again, True, True])
 
         async def refused(room_id: str, message_id: str) -> bool:
-            if plays.pop(0):
+            if next(plays):
                 await ctx.resume_room()
             raise RoomExecutionStoppedError(room_id)
 
