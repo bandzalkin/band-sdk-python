@@ -1965,24 +1965,24 @@ class ExecutionContext:
         actionable and replays via /next on play.
 
         A play applied while the claim was in flight supersedes the refusal,
-        so the message is claimed again at once instead of waiting out an
-        idle interval in an already-resumed room. A refusal of that re-claim
-        is not adopted: a platform node may still be serving the cached stop,
-        and this process, having just heard the play, also hears any newer
-        stop as a control signal. The claim fails and is retried later.
+        so the message is claimed again, once, at once, instead of waiting out
+        an idle interval in an already-resumed room. A refusal of that
+        re-claim is not adopted: a platform node may still be serving the
+        cached stop, and this process, having just heard the play, also hears
+        any newer stop as a control signal. The claim fails and is retried
+        later.
         """
-        resumed_during_claim = False
-        while True:
-            resume_count = self._resume_count
-            try:
-                return await self.link.mark_processing(self.room_id, message_id)
-            except RoomExecutionStoppedError:
-                if self._resume_count != resume_count:
-                    resumed_during_claim = True
-                    continue
-                if not resumed_during_claim:
-                    self.mark_stopped_by_platform()
+        resume_count = self._resume_count
+        try:
+            return await self.link.mark_processing(self.room_id, message_id)
+        except RoomExecutionStoppedError:
+            if self._resume_count == resume_count:
+                self.mark_stopped_by_platform()
                 return False
+        try:
+            return await self.link.mark_processing(self.room_id, message_id)
+        except RoomExecutionStoppedError:
+            return False
 
     async def _claim(self, msg_id: str) -> bool:
         """Claim ``msg_id`` for one of this room's own deliveries; a refused
