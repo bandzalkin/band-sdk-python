@@ -86,13 +86,14 @@ class SessionConfig:
     # constructor validates this range itself -- no second Python-side check.
     max_message_retries: int = 1
     enable_context_hydration: bool = True  # Whether to fetch history from platform API
-    # Phase 2 idle timeout (seconds) before re-polling /next as a safety net.
-    # Lower values recover faster from missed WS pushes but generate more REST traffic.
-    # With N rooms, each resync fires N parallel /next polls. Default 60s balances
-    # recovery speed against REST load for typical single-agent deployments.
+    # Phase 2 idle timeout (seconds) before re-polling /next as a safety net for a
+    # missed WS push. This is the base interval: each room draws its wait from the
+    # upper half of it, so rooms that started together do not poll together.
     # Uses float so tests can exercise sub-second values without forcing prod to
     # round. Must be > 0; zero or negative turns Phase 2 into a REST hot loop.
     idle_resync_seconds: float = 60.0
+    # Its backoff cap is idle_resync_max_seconds, declared last so existing
+    # positional constructor calls keep their meaning.
 
     # --- Working-state (boolean "is the agent reasoning") reporting ---
     # Kill-switch: disable all working-state reporting instantly if needed.
@@ -124,10 +125,21 @@ class SessionConfig:
     # never received.
     report_turn_failures_to_room: bool = True
 
+    # Each idle poll that finds nothing to run doubles a room's interval, up to
+    # this cap (never below idle_resync_seconds); an event queued for the room or
+    # a backlog message the room claims returns it to the base. With jitter, a
+    # quiet room then polls on average every three quarters of the cap.
+    idle_resync_max_seconds: float = 300.0
+
     def __post_init__(self) -> None:
         if self.idle_resync_seconds <= 0:
             raise ValueError(
                 f"idle_resync_seconds must be > 0 (got {self.idle_resync_seconds})"
+            )
+        if self.idle_resync_max_seconds <= 0:
+            raise ValueError(
+                "idle_resync_max_seconds must be > 0 "
+                f"(got {self.idle_resync_max_seconds})"
             )
 
         # Working-state invariants only matter when reporting is enabled.
