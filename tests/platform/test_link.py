@@ -30,6 +30,7 @@ from band.client.streaming import (
     WebSocketClient,
     WebSocketDisconnectReason,
 )
+from band.core.exceptions import RoomExecutionStoppedError
 from band.core.types import ConflictPolicy
 from band.platform.event import (
     MessageEvent,
@@ -1008,28 +1009,42 @@ class TestBandLinkEventHandlers:
 class TestMessageLifecycleMarks:
     """Tests for message lifecycle status return values."""
 
-    @pytest.mark.asyncio
-    async def test_mark_processing_returns_true_on_success(self):
+    @staticmethod
+    def _link_answering_claim(**mock_kwargs) -> BandLink:
         link = BandLink(agent_id="agent-123", api_key="test-key")
         link.rest = MagicMock()
-        link.rest.agent_api_messages.mark_agent_message_processing = AsyncMock()
+        link.rest.agent_api_messages.with_raw_response.mark_agent_message_processing = (
+            AsyncMock(**mock_kwargs)
+        )
+        return link
+
+    @pytest.mark.asyncio
+    async def test_mark_processing_returns_true_on_success(self):
+        link = self._link_answering_claim(return_value=MagicMock(status_code=200))
 
         result = await link.mark_processing("room-1", "msg-1")
 
         assert result is True
-        link.rest.agent_api_messages.mark_agent_message_processing.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_mark_processing_returns_false_on_error(self):
-        link = BandLink(agent_id="agent-123", api_key="test-key")
-        link.rest = MagicMock()
-        link.rest.agent_api_messages.mark_agent_message_processing = AsyncMock(
-            side_effect=Exception("network down")
-        )
+        link = self._link_answering_claim(side_effect=Exception("network down"))
 
         result = await link.mark_processing("room-1", "msg-1")
 
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_mark_processing_raises_when_room_execution_is_stopped(self):
+        """The platform refuses a claim in a room whose agent execution is
+        stopped with an empty 204 instead of the 200 a claim returns; reading
+        that as success would run a turn whose every post is then rejected."""
+        link = self._link_answering_claim(return_value=MagicMock(status_code=204))
+
+        with pytest.raises(RoomExecutionStoppedError) as excinfo:
+            await link.mark_processing("room-1", "msg-1")
+
+        assert excinfo.value.room_id == "room-1"
 
     @pytest.mark.asyncio
     async def test_mark_processed_returns_true_on_success(self):

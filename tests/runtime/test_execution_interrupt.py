@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from band.client.streaming import ControlMode
+from band.core.exceptions import RoomExecutionStoppedError
 from band.core.protocols import TurnDeferred, TurnDeferredCancellation
 from band.runtime.execution import BacklogProcessResult, ExecutionContext
 from band.runtime.types import PlatformMessage, SessionConfig
@@ -365,6 +366,129 @@ class TestPlatformStoppedRoom:
         assert ok is True
         assert handler.invoked == []  # adapter not invoked while stopped
         mock_link.get_stale_processing_messages.assert_not_awaited()
+
+    async def test_refused_claim_adopts_stop_without_running_the_turn(self, mock_link):
+        """A claim the platform refuses because the room is stopped must not
+        run the turn (every post would be rejected) or mark the message
+        failed: it stays actionable for /next replay on play."""
+        mock_link.mark_processing = AsyncMock(
+            side_effect=RoomExecutionStoppedError("room-123")
+        )
+        handler = BlockingHandler(block=False)
+        ctx = ExecutionContext("room-123", mock_link, handler, agent_id="agent-123")
+
+        result = await ctx._process_event(make_message_event(msg_id="m1"))
+
+        assert result is True
+        assert ctx.is_stopped is True
+        assert handler.invoked == []
+        mock_link.mark_failed.assert_not_awaited()
+        mock_link.mark_processed.assert_not_awaited()
+
+    async def test_refused_claim_does_not_charge_the_retry_budget(self, mock_link):
+        """At the default single retry, a claim refused while stopped must
+        leave the message's budget intact so the replay after play runs."""
+        mock_link.mark_processing = AsyncMock(
+            side_effect=[RoomExecutionStoppedError("room-123"), True]
+        )
+        handler = BlockingHandler(block=False)
+        ctx = ExecutionContext("room-123", mock_link, handler, agent_id="agent-123")
+
+        await ctx._process_event(make_message_event(msg_id="m1"))
+        await ctx.resume_room()
+        result = await ctx._process_backlog_message(_backlog_message("m1"))
+
+        assert result == BacklogProcessResult.ADVANCED
+        assert handler.completed == ["m1"]
+
+    async def test_refused_backlog_claim_ends_the_sync_quietly(self, mock_link):
+        """A fresh process does not know the room was stopped while it was
+        down. The first refused backlog claim must adopt the stop and end the
+        /next drain instead of running the turn or polling again."""
+        mock_link.get_next_message = AsyncMock(return_value=_backlog_message("b1"))
+        mock_link.mark_processing = AsyncMock(
+            side_effect=RoomExecutionStoppedError("room-123")
+        )
+        handler = BlockingHandler(block=False)
+        ctx = ExecutionContext("room-123", mock_link, handler, agent_id="agent-123")
+
+        synced = await ctx._synchronize_with_next()
+
+        assert synced is True
+        assert ctx.is_stopped is True
+        assert handler.invoked == []
+        mock_link.get_next_message.assert_awaited_once()
+        mock_link.mark_failed.assert_not_awaited()
+
+    async def test_refused_stale_claim_ends_the_startup_sync(self, mock_link):
+        """The turn a stop aborted left its message in 'processing', so a
+        fresh process finds it in the recovery sweep. The first refused claim
+        must end the sweep and skip /next: the room is stopped, so neither
+        the remaining stale messages nor /next can be worked."""
+        stale = [_backlog_message("s1"), _backlog_message("s2")]
+        mock_link.get_stale_processing_messages = AsyncMock(return_value=stale)
+        # Stale recovery drains the room's whole actionable snapshot.
+        mock_link.get_actionable_messages = AsyncMock(return_value=stale)
+        mock_link.mark_processing = AsyncMock(
+            side_effect=RoomExecutionStoppedError("room-123")
+        )
+        handler = BlockingHandler(block=False)
+        ctx = ExecutionContext("room-123", mock_link, handler, agent_id="agent-123")
+
+        synced = await ctx._synchronize_with_next()
+
+        assert synced is True
+        assert ctx.is_stopped is True
+        assert handler.invoked == []
+        mock_link.mark_processing.assert_awaited_once()
+        mock_link.get_next_message.assert_not_awaited()
+
+    async def test_play_during_refused_claim_runs_the_turn(self, mock_link):
+        """The claim's refusal reports the platform's state when it answered.
+        A play that reaches this process while the claim is still in flight
+        supersedes it: adopting the stale refusal would leave a resumed room
+        silent until another play, and treating it as a failed claim would
+        park the message for a full idle interval. Claim again instead."""
+        handler = BlockingHandler(block=False)
+        ctx = ExecutionContext("room-123", mock_link, handler, agent_id="agent-123")
+        answers: list[bool | None] = [None, True]
+
+        async def refused_once_around_a_play(room_id: str, message_id: str) -> bool:
+            if answers.pop(0) is None:
+                await ctx.resume_room()
+                raise RoomExecutionStoppedError(room_id)
+            return True
+
+        mock_link.mark_processing = AsyncMock(side_effect=refused_once_around_a_play)
+
+        result = await ctx._process_backlog_message(_backlog_message("m1"))
+
+        assert ctx.is_stopped is False
+        assert result == BacklogProcessResult.ADVANCED
+        assert handler.completed == ["m1"]
+
+    async def test_refusal_right_after_a_play_is_retried_not_adopted(self, mock_link):
+        """A re-claim refused just after a play may come from a platform node
+        still serving the cached stop. This process hears any newer stop as a
+        control signal, so the refusal must not silence the resumed room: the
+        claim fails and is retried later."""
+        handler = BlockingHandler(block=False)
+        ctx = ExecutionContext("room-123", mock_link, handler, agent_id="agent-123")
+        plays = [True, False]
+
+        async def refused(room_id: str, message_id: str) -> bool:
+            if plays.pop(0):
+                await ctx.resume_room()
+            raise RoomExecutionStoppedError(room_id)
+
+        mock_link.mark_processing = AsyncMock(side_effect=refused)
+
+        result = await ctx._process_backlog_message(_backlog_message("m1"))
+
+        assert ctx.is_stopped is False
+        assert result == BacklogProcessResult.RETRY_LATER
+        assert handler.invoked == []
+        assert mock_link.mark_processing.await_count == 2
 
 
 class TestBacklogInterrupt:
