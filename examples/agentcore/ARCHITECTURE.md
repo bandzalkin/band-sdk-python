@@ -142,7 +142,10 @@ Inside `OneShotInvoker.handle_event`, each invocation:
 1. Calls `link.get_next_message(room_id)` — the platform returns the
    next unprocessed message for this agent. If it's not the triggering
    message (or no message is open), skip the LLM call.
-2. Calls `link.mark_processing(room_id, msg_id)` to claim the message.
+2. Calls `link.mark_processing(room_id, msg_id)` to claim the message. If
+   the room's agent execution is stopped, the platform refuses the claim
+   and `handle_event` raises `RoomExecutionStoppedError` before the LLM
+   runs; the message stays open and replays once the room is resumed.
 3. Runs the LLM (which sees the *full* history including any other
    un-answered mentions), recording the message ids in that history
    snapshot as `seen_ids`.
@@ -152,7 +155,8 @@ Inside `OneShotInvoker.handle_event`, each invocation:
    had visibility into those during its turn — whatever was unanswered is
    now this agent's responsibility, replied or not. A message that arrived
    *after* the snapshot is **not** swallowed: drain stops and leaves it
-   open so the next invocation handles it with fresh context. (Self-
+   open so the next invocation handles it with fresh context. A claim the
+   platform refuses because the room was stopped also ends the drain. (Self-
    messages are skipped defensively; hitting the drain cap surfaces
    `drain_truncated: true` in the response.)
 
