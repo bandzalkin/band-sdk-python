@@ -23,6 +23,7 @@ from band_rest import (
 from pydantic import BaseModel, Field
 
 from band.adapters.anthropic import AnthropicAdapter
+from band.core.exceptions import RoomExecutionStoppedError
 from band.core.model_catalog import ModelSelection, ModelSelectionError
 from band.core.simple_adapter import SimpleAdapter
 from band.core.types import Capability
@@ -423,6 +424,24 @@ class TestProcessMessage:
         link.mark_processed.assert_awaited_once_with("room-1", "msg-1")
         link.mark_failed.assert_not_awaited()
 
+    async def test_refused_claim_in_stopped_room_raises_without_running(self) -> None:
+        """The room was stopped between /next and the claim: the platform
+        refuses the claim, so the adapter must not run and the message must
+        not be marked failed -- it stays actionable for replay on play."""
+        link = make_link_mock(next_messages=[platform_msg("msg-1"), None])
+        link.mark_processing = AsyncMock(
+            side_effect=RoomExecutionStoppedError("room-1")
+        )
+        adapter = _make_adapter_mock()
+        invoker = await _make_invoker(link, adapter)
+
+        with pytest.raises(RoomExecutionStoppedError):
+            await invoker.handle_event(_msg_body())
+
+        adapter.on_event.assert_not_awaited()
+        link.mark_failed.assert_not_awaited()
+        link.mark_processed.assert_not_awaited()
+
     async def test_skips_self_message(self) -> None:
         link = make_link_mock()
         adapter = _make_adapter_mock()
@@ -771,6 +790,30 @@ class TestDrain:
 
         assert result["status"] == "done"
         assert result.get("drain_truncated") is True
+
+    async def test_drain_stops_when_the_room_is_stopped(self) -> None:
+        """A stop landing after the turn refuses the drain's claims. The drain
+        must end there and must not report the refused message as drained:
+        the platform keeps it actionable for replay on play."""
+        link = make_link_mock(
+            history_items=[ctx_item("msg-2")],
+            next_messages=[
+                platform_msg("msg-1"),  # claim check
+                platform_msg("msg-2"),  # drain candidate, room now stopped
+                None,
+            ],
+        )
+        link.mark_processing = AsyncMock(
+            side_effect=[True, RoomExecutionStoppedError("room-1")]
+        )
+        invoker = await _make_invoker(link, _make_adapter_mock())
+
+        result = await invoker.handle_event(_msg_body(msg_id="msg-1"))
+
+        assert result["status"] == "done"
+        assert "drained" not in result
+        processed_ids = [c.args[1] for c in link.mark_processed.await_args_list]
+        assert processed_ids == ["msg-1"]
 
 
 # ---------------------------------------------------------------------------
