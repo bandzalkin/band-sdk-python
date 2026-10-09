@@ -54,6 +54,7 @@ from band_sdk_core import (
 )
 
 from band.client.rest import DEFAULT_REQUEST_OPTIONS
+from band.core.exceptions import RoomExecutionStoppedError
 from band.core.protocols import FrameworkAdapter
 from band.core.simple_adapter import SimpleAdapter
 from band.core.types import (
@@ -233,6 +234,10 @@ class OneShotInvoker:
                 ``message_created`` or room-cleanup event, or a
                 ``message_created`` payload missing a required field.
             RuntimeError: ``startup()`` was not called first.
+            RoomExecutionStoppedError: the platform refused the claim because
+                the room's agent execution is stopped. Nothing ran and the
+                message stays actionable, so it replays once the room is
+                resumed (a play signal).
         """
         if not self._started:
             raise RuntimeError("OneShotInvoker.startup() not called")
@@ -330,7 +335,10 @@ class OneShotInvoker:
         1. ``get_next_message`` — if the triggering message isn't the next
            open one for this agent, exit early (a sibling invocation already
            claimed it, or there's an older unprocessed message ahead of it).
-        2. ``mark_processing`` — claim it.
+        2. ``mark_processing`` — claim it. A claim the platform refuses
+           because the room's execution is stopped raises
+           ``RoomExecutionStoppedError`` before the adapter runs; the message
+           stays actionable for replay on play, so it is not marked failed.
         3. Fetch participants + history, build ``AgentInput``, run adapter.
         4. ``mark_processed`` on success.
         5. Drain — only swallow messages the LLM actually saw (``seen_ids``).
@@ -456,7 +464,17 @@ class OneShotInvoker:
                     break
                 case {"decision": "drain", "message_id": stale_id}:
                     stale_id = cast(str, stale_id)
-                    await self._link.mark_processing(room_id, stale_id)
+                    try:
+                        await self._link.mark_processing(room_id, stale_id)
+                    except RoomExecutionStoppedError:
+                        # Stopped after the turn: the platform keeps this and
+                        # every later message actionable for replay on play.
+                        logger.info(
+                            "Drain stopped at %s in room %s — room execution is stopped",
+                            stale_id,
+                            room_id,
+                        )
+                        break
                     await self._link.mark_processed(room_id, stale_id)
                     drained.append(stale_id)
         else:

@@ -43,6 +43,7 @@ from band.client.streaming import (
     MessageCreatedPayload,
     MessageMetadata,
 )
+from band.core.exceptions import RoomExecutionStoppedError
 from band.core.protocols import (
     GENERIC_PROVIDER_FAILURE_MESSAGE,
     TURN_FAILURE_PROVIDER,
@@ -371,6 +372,9 @@ class ExecutionContext:
         # idle /next polling and short-circuits WS triggers while stopped to
         # avoid /next->204 and mark->204/reply->403 churn. Not persisted.
         self._stopped: bool = False
+        # Counts play signals, so a refusal that answered before a play this
+        # process has already applied is not adopted as a fresh stop.
+        self._resume_count: int = 0
 
         # Optional seam for clearing user-visible activity state ("reasoning…")
         # when a cycle is interrupted/stopped. Filled by the activity-signal
@@ -732,13 +736,14 @@ class ExecutionContext:
         does not skip the catch-up it just requested.
         """
         self._stopped = False
+        self._resume_count += 1
         await self.request_resync()
 
     def mark_stopped_by_platform(self) -> None:
         """Adopt a room stop that the platform applied without this process
-        seeing the signal: an event post came back 403 because the room's
-        execution is stopped (a stop issued while this run was offline, or by
-        another connection).
+        seeing the signal: an event post came back 403, or a message claim
+        came back 204, because the room's execution is stopped (a stop issued
+        while this run was offline, or by another connection).
 
         Treats the room as stopped exactly as if a stop control had arrived --
         abort the in-flight cycle and go quiet until a play signal -- so the
@@ -1576,6 +1581,10 @@ class ExecutionContext:
             # invoke the adapter; otherwise the platform will keep returning the
             # same message and the agent may replay side effects.
             if not await self._claim(msg_id):
+                if self._stopped:
+                    # Same result as a cycle aborted by stop: the sync and
+                    # resync loops see the room stopped and pause /next polling.
+                    return BacklogProcessResult.ADVANCED
                 logger.warning(
                     "ExecutionContext %s: Could not claim backlog message %s",
                     self.room_id,
@@ -1944,11 +1953,34 @@ class ExecutionContext:
 
     async def _claim(self, msg_id: str) -> bool:
         """Mark ``msg_id`` processing on the platform; a refused claim never
-        ran the handler, so it gives back the attempt already charged."""
-        if await self.link.mark_processing(self.room_id, msg_id):
-            return True
-        self._retry_tracker.discard_attempt(msg_id)
-        return False
+        ran the handler, so it gives back the attempt already charged.
+
+        A claim refused because the room's execution is stopped adopts that
+        stop before returning False, so callers tell it apart from a failed
+        claim by ``is_stopped``. The message stays actionable and replays via
+        /next on play.
+
+        A play applied while the claim was in flight supersedes the refusal,
+        so the message is claimed again at once instead of waiting out an
+        idle interval in an already-resumed room. A refusal of that re-claim
+        is not adopted: a platform node may still be serving the cached stop,
+        and this process, having just heard the play, also hears any newer
+        stop as a control signal. The claim fails and is retried later.
+        """
+        resumed_during_claim = False
+        while True:
+            resume_count = self._resume_count
+            try:
+                if await self.link.mark_processing(self.room_id, msg_id):
+                    return True
+            except RoomExecutionStoppedError:
+                if self._resume_count != resume_count:
+                    resumed_during_claim = True
+                    continue
+                if not resumed_during_claim:
+                    self.mark_stopped_by_platform()
+            self._retry_tracker.discard_attempt(msg_id)
+            return False
 
     async def _abort_cycle(self, kind: ControlMode, msg_id: str | None) -> bool:
         """Unwind an aborted cycle (interrupt/stop): drop work, send nothing.
@@ -2228,6 +2260,9 @@ class ExecutionContext:
 
                 # For messages: mark as processing on server
                 if not await self._claim(msg_id):
+                    if self._stopped:
+                        # Left actionable: /next replays it on play.
+                        return True
                     logger.warning(
                         "ExecutionContext %s: Could not claim message %s",
                         self.room_id,
