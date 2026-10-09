@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from http import HTTPStatus
 from typing import Any
 
 from band_rest.core.api_error import ApiError
@@ -16,6 +17,7 @@ from band_rest.types.chat_message import ChatMessage
 from band_rest.types.chat_message_metadata import ChatMessageMetadata
 
 from band.client.rest import DEFAULT_REQUEST_OPTIONS, AsyncRestClient
+from band.core.exceptions import RoomExecutionStoppedError
 from band.core.types import metadata_to_dict
 from band.runtime.types import PlatformMessage
 
@@ -64,10 +66,21 @@ class MessageLifecycle:
         This does NOT remove it from /next: the actionable set excludes only
         'processed', so a crashed or stopped attempt stays replayable. Only
         mark_processed clears the message from /next.
+
+        Returns False when the call fails; the caller must not run the turn.
+
+        Raises:
+            RoomExecutionStoppedError: When the platform refuses the claim
+                because this room's agent execution is stopped. The message
+                stays actionable and replays via /next once the execution is
+                resumed (a play signal).
         """
         logger.debug("Marking message %s as processing", message_id)
         try:
-            await rest.agent_api_messages.mark_agent_message_processing(
+            # The raw response is the only place the status code survives:
+            # the plain client returns ``None`` for any empty body, so it
+            # cannot tell the stopped room's 204 from a malformed reply.
+            response = await rest.agent_api_messages.with_raw_response.mark_agent_message_processing(
                 chat_id=room_id,
                 id=message_id,
                 request_options=DEFAULT_REQUEST_OPTIONS,
@@ -75,6 +88,12 @@ class MessageLifecycle:
         except Exception as e:  # noqa: BLE001 -- best-effort event emission must not crash the turn/link
             logger.warning("Failed to mark message %s as processing: %s", message_id, e)
             return False
+        # A claim is answered 200 with the updated message; the platform
+        # answers 204 only when it refuses the claim because this room's
+        # execution is stopped. Reading that as success would run a turn whose
+        # every post is then rejected.
+        if response.status_code == HTTPStatus.NO_CONTENT:
+            raise RoomExecutionStoppedError(room_id)
         return True
 
     async def mark_processed(
