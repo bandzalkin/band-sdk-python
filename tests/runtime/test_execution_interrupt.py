@@ -490,6 +490,33 @@ class TestPlatformStoppedRoom:
         assert handler.invoked == []
         assert mock_link.mark_processing.await_count == 2
 
+    async def test_claim_message_shares_the_stop_policy(self, mock_link):
+        """A host that claims more messages into a running turn (merging a
+        burst of waiting messages) claims through claim_message, so a refusal
+        stops the room exactly as the room's own deliveries do, and a play
+        applied while that claim was in flight still supersedes it."""
+        handler = BlockingHandler(block=False)
+        ctx = ExecutionContext("room-123", mock_link, handler, agent_id="agent-123")
+        mock_link.mark_processing = AsyncMock(
+            side_effect=RoomExecutionStoppedError("room-123")
+        )
+
+        assert await ctx.claim_message("m2") is False
+        assert ctx.is_stopped is True
+
+        answers: list[bool | None] = [None, True]
+
+        async def refused_once_around_a_play(room_id: str, message_id: str) -> bool:
+            if answers.pop(0) is None:
+                await ctx.resume_room()
+                raise RoomExecutionStoppedError(room_id)
+            return True
+
+        mock_link.mark_processing = AsyncMock(side_effect=refused_once_around_a_play)
+
+        assert await ctx.claim_message("m3") is True
+        assert ctx.is_stopped is False
+
 
 class TestBacklogInterrupt:
     async def test_interrupt_during_backlog_consumes_and_advances(self, mock_link):
