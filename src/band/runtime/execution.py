@@ -1951,14 +1951,18 @@ class ExecutionContext:
         finally:
             self._active_cycle_task = None
 
-    async def _claim(self, msg_id: str) -> bool:
-        """Mark ``msg_id`` processing on the platform; a refused claim never
-        ran the handler, so it gives back the attempt already charged.
+    async def claim_message(self, message_id: str) -> bool:
+        """Mark ``message_id`` processing on the platform for this room.
+
+        Every claim the room makes goes through here, including messages a
+        host claims into a turn that is already running (merging a burst of
+        waiting messages), so a stopped room is handled the same way on every
+        path. Returns True when the message is claimed.
 
         A claim refused because the room's execution is stopped adopts that
-        stop before returning False, so callers tell it apart from a failed
-        claim by ``is_stopped``. The message stays actionable and replays via
-        /next on play.
+        stop (``mark_stopped_by_platform``) and returns False; callers tell it
+        apart from a failed claim by ``is_stopped``. The message stays
+        actionable and replays via /next on play.
 
         A play applied while the claim was in flight supersedes the refusal,
         so the message is claimed again at once instead of waiting out an
@@ -1971,16 +1975,23 @@ class ExecutionContext:
         while True:
             resume_count = self._resume_count
             try:
-                if await self.link.mark_processing(self.room_id, msg_id):
-                    return True
+                return await self.link.mark_processing(self.room_id, message_id)
             except RoomExecutionStoppedError:
                 if self._resume_count != resume_count:
                     resumed_during_claim = True
                     continue
                 if not resumed_during_claim:
                     self.mark_stopped_by_platform()
-            self._retry_tracker.discard_attempt(msg_id)
-            return False
+                return False
+
+    async def _claim(self, msg_id: str) -> bool:
+        """Claim ``msg_id`` for one of this room's own deliveries; a refused
+        claim never ran the handler, so it gives back the attempt already
+        charged."""
+        if await self.claim_message(msg_id):
+            return True
+        self._retry_tracker.discard_attempt(msg_id)
+        return False
 
     async def _abort_cycle(self, kind: ControlMode, msg_id: str | None) -> bool:
         """Unwind an aborted cycle (interrupt/stop): drop work, send nothing.
