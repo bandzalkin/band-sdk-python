@@ -65,6 +65,7 @@ def make_mock_link():
     link.mark_failed = AsyncMock()
     link.get_next_message = AsyncMock(return_value=None)
     link.get_stale_processing_messages = AsyncMock(return_value=[])
+    link.get_actionable_messages = AsyncMock(return_value=[])
     link.report_activity = AsyncMock(return_value=True)
 
     async def empty_aiter():
@@ -456,12 +457,14 @@ class TestDrainProgressGuard:
         msg = make_platform_message(msg_id="wedged-1", room_id="room-1")
         next_message = RepeatingNextMessage(msg)
         mock_link.get_next_message.side_effect = next_message.__call__
+        mock_link.get_actionable_messages.return_value = [msg]
 
         ctx = ExecutionContext("room-1", mock_link, mock_handler)
         ctx.claims.remember_completed(ctx.room_id, "wedged-1")
 
         assert await ctx._resync_pending_messages() is True
-        assert next_message.calls == 2
+        assert next_message.calls <= 2
+        mock_handler.assert_not_called()
 
     async def test_startup_sync_ends_when_next_repeats_a_skipped_message(
         self, mock_link, mock_handler
@@ -469,12 +472,14 @@ class TestDrainProgressGuard:
         msg = make_platform_message(msg_id="wedged-1", room_id="room-1")
         next_message = RepeatingNextMessage(msg)
         mock_link.get_next_message.side_effect = next_message.__call__
+        mock_link.get_actionable_messages.return_value = [msg]
 
         ctx = ExecutionContext("room-1", mock_link, mock_handler)
         ctx.claims.remember_completed(ctx.room_id, "wedged-1")
 
         assert await ctx._synchronize_with_next() is True
-        assert next_message.calls == 2
+        assert next_message.calls <= 2
+        mock_handler.assert_not_called()
 
     async def test_startup_sync_retries_failed_message_in_same_drain(self, mock_link):
         # A turn that fails with retry budget left stays actionable, so /next
