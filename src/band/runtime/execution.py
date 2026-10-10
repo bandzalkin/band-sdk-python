@@ -99,6 +99,11 @@ class ResyncRequest:
 class BacklogProcessResult(Enum):
     ADVANCED = "advanced"
     RETRY_LATER = "retry_later"
+    # Skipped from local knowledge (completed, permanently failed, or the
+    # agent's own message); the platform's copy of the message is unchanged,
+    # so /next will offer it again while it stays the oldest not-processed
+    # one.
+    NO_PROGRESS = "no_progress"
 
 
 class ResyncOutcome(Enum):
@@ -1232,6 +1237,7 @@ class ExecutionContext:
         )
 
         previous_id: str | None = None
+        skipped: set[str] = set()
         try:
             while True:
                 revision = self._control_revision
@@ -1262,6 +1268,15 @@ class ExecutionContext:
                     )
                     break
 
+                if next_msg.id in skipped:
+                    logger.warning(
+                        "ExecutionContext %s: /next re-returned message %s "
+                        "already skipped in this drain; ending sync",
+                        self.room_id,
+                        next_msg.id,
+                    )
+                    break
+
                 at_sync_point = next_msg.id == self._first_ws_msg_id
                 level = logging.INFO if at_sync_point else logging.DEBUG
                 message = (
@@ -1281,6 +1296,8 @@ class ExecutionContext:
                     self._first_ws_msg_id = None
                     self._sync_complete = True
                     return True
+                if result == BacklogProcessResult.NO_PROGRESS:
+                    skipped.add(next_msg.id)
 
                 if self._stopped:
                     # A stop control signal landed mid-cycle: the message was
@@ -1327,6 +1344,7 @@ class ExecutionContext:
         """Drain actionable work, distinguishing empty from blocked recovery."""
         self._resync_handled_work = False
         previous_id: str | None = None
+        skipped: set[str] = set()
         try:
             while True:
                 revision = self._control_revision
@@ -1342,6 +1360,8 @@ class ExecutionContext:
                         if self._resync_handled_work
                         else ResyncOutcome.EMPTY
                     )
+                if next_msg.id in skipped:
+                    return ResyncOutcome.BLOCKED
                 if (
                     next_msg.id == previous_id
                     and self._backlog_is_nonrunnable(next_msg)
@@ -1357,6 +1377,8 @@ class ExecutionContext:
                     return ResyncOutcome.BLOCKED
                 if result is BacklogProcessResult.RETRY_LATER:
                     return ResyncOutcome.RETRY
+                if result is BacklogProcessResult.NO_PROGRESS:
+                    skipped.add(next_msg.id)
         except Exception:
             logger.exception(
                 "ExecutionContext %s: Error during /next resync", self.room_id
@@ -1403,17 +1425,17 @@ class ExecutionContext:
             agent_id=self._agent_id,
         ):
             logger.debug("Skipping self-message %s", msg_id)
-            return BacklogProcessResult.ADVANCED
+            return BacklogProcessResult.NO_PROGRESS
 
         # Skip permanently failed messages
         if self._retry_tracker.is_permanently_failed(msg_id):
             logger.debug("Skipping permanently failed message %s", msg_id)
-            return BacklogProcessResult.ADVANCED
+            return BacklogProcessResult.NO_PROGRESS
 
         # Skip if already processed (dedupe)
         if self.claims.is_completed(self.room_id, msg_id):
             logger.debug("Skipping duplicate backlog message: %s", msg_id)
-            return BacklogProcessResult.ADVANCED
+            return BacklogProcessResult.NO_PROGRESS
 
         if self.claims.is_ack_pending(self.room_id, msg_id):
             logger.debug("Retrying processed ack for backlog message: %s", msg_id)
