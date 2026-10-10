@@ -1250,6 +1250,14 @@ class ExecutionContext:
         previous_id: str | None = None
         skipped: set[str] = set()
         try:
+            sync_marker = self._first_ws_msg_id
+            # Recover a complete ordered snapshot before newer processing work.
+            if not await self._recover_stale_processing_messages():
+                return False
+            if self._stopped or (
+                sync_marker is not None and self._first_ws_msg_id is None
+            ):
+                return True
             while True:
                 revision = self._control_revision
                 next_msg = await self._get_next_message()
@@ -1271,13 +1279,14 @@ class ExecutionContext:
                     self._sync_complete = True
                     return True
 
-                if self._retry_tracker.is_permanently_failed(next_msg.id):
-                    logger.warning(
-                        "ExecutionContext %s: Skipping permanently failed message %s",
-                        self.room_id,
-                        next_msg.id,
+                if self._backlog_message_is_skipped(next_msg):
+                    await self._process_backlog_message(next_msg)
+                    synchronized = await self._recover_actionable_backlog(
+                        sync_to_websocket=True
                     )
-                    break
+                    if synchronized:
+                        self._sync_complete = True
+                    return synchronized
 
                 if next_msg.id in skipped:
                     logger.warning(
@@ -1301,12 +1310,14 @@ class ExecutionContext:
                 )
                 if result is BacklogProcessResult.RETRY_LATER:
                     return False
-                if at_sync_point:
+                if at_sync_point and self._backlog_message_is_skipped(next_msg):
                     # Preserve other queued events when removing the sync point.
                     self._drain_duplicate_from_queue(next_msg.id)
                     self._first_ws_msg_id = None
                     self._sync_complete = True
                     return True
+                if at_sync_point:
+                    return False
                 if result == BacklogProcessResult.NO_PROGRESS:
                     skipped.add(next_msg.id)
 
@@ -1325,12 +1336,12 @@ class ExecutionContext:
                     break
 
                 if self._retry_tracker.is_permanently_failed(next_msg.id):
-                    logger.warning(
-                        "ExecutionContext %s: Message %s permanently failed",
-                        self.room_id,
-                        next_msg.id,
+                    synchronized = await self._recover_actionable_backlog(
+                        sync_to_websocket=True
                     )
-                    break
+                    if synchronized:
+                        self._sync_complete = True
+                    return synchronized
 
         except Exception:
             logger.exception("ExecutionContext %s: Sync error", self.room_id)
@@ -1339,6 +1350,78 @@ class ExecutionContext:
         logger.debug("ExecutionContext %s: Synchronization complete", self.room_id)
         self._sync_complete = True
         return True
+
+    def _backlog_message_is_skipped(self, msg: PlatformMessage) -> bool:
+        """Whether advancing past this delivery cannot replay eligible work."""
+        return (
+            self._retry_tracker.is_permanently_failed(msg.id)
+            or self.claims.is_completed(self.room_id, msg.id)
+            or self._delivery_status_for_agent(msg.metadata) == DeliveryStatus.PROCESSED
+            or bool(
+                self._agent_id
+                and is_self_echo(
+                    sender_id=msg.sender_id or "",
+                    sender_type=msg.sender_type or "",
+                    agent_id=self._agent_id,
+                )
+            )
+        )
+
+    async def _recover_actionable_backlog(
+        self, *, sync_to_websocket: bool = False
+    ) -> bool:
+        """Drain one complete FIFO snapshot without re-polling a retained /next head."""
+        revision = self._control_revision
+        messages = await self.link.get_actionable_messages(self.room_id)
+        for msg in messages:
+            if self._stopped:
+                return True
+            if revision != self._control_revision:
+                return False
+            result = await self._process_backlog_message(msg, revision=revision)
+            if result == BacklogProcessResult.RETRY_LATER:
+                return False
+            if self._stopped:
+                return True
+            if revision != self._control_revision:
+                return False
+            if not self._backlog_message_is_skipped(msg):
+                # A retryable handler failure remains eligible and must keep
+                # its FIFO position until it succeeds or exhausts its budget.
+                return False
+            if sync_to_websocket and msg.id == self._first_ws_msg_id:
+                self._drain_duplicate_from_queue(msg.id)
+                self._first_ws_msg_id = None
+                self._sync_complete = True
+                return True
+        return True
+
+    async def _recover_stale_processing_messages(self) -> bool:
+        """
+        Recover messages stuck in 'processing' state from a previous crash.
+
+        The presence of stale processing work triggers a complete actionable
+        snapshot. Processing only the stale subset could otherwise run newer
+        messages ahead of older pending or failed deliveries.
+
+        Skipped while stopped: stopped work must remain replayable on resume,
+        not be resurrected by reconnect recovery.
+        """
+        if self._stopped:
+            logger.debug(
+                "ExecutionContext %s: stopped, skipping stale-processing recovery",
+                self.room_id,
+            )
+            return True
+
+        revision = self._control_revision
+        stale_messages = await self.link.get_stale_processing_messages(self.room_id)
+        if revision != self._control_revision:
+            return False
+        if not stale_messages:
+            return True
+
+        return await self._recover_actionable_backlog(sync_to_websocket=True)
 
     async def _get_next_message(self) -> PlatformMessage | None:
         """
@@ -1371,6 +1454,19 @@ class ExecutionContext:
                         if self._resync_handled_work
                         else ResyncOutcome.EMPTY
                     )
+                if self._backlog_message_is_skipped(next_msg):
+                    recovered = await self._recover_actionable_backlog()
+                    if self._stopped:
+                        return ResyncOutcome.STOPPED
+                    if revision != self._control_revision:
+                        return ResyncOutcome.BLOCKED
+                    if not recovered:
+                        return ResyncOutcome.RETRY
+                    return (
+                        ResyncOutcome.WORK
+                        if self._resync_handled_work
+                        else ResyncOutcome.BLOCKED
+                    )
                 if next_msg.id in skipped:
                     return ResyncOutcome.BLOCKED
                 if (
@@ -1388,6 +1484,19 @@ class ExecutionContext:
                     return ResyncOutcome.BLOCKED
                 if result is BacklogProcessResult.RETRY_LATER:
                     return ResyncOutcome.RETRY
+                if self._retry_tracker.is_permanently_failed(next_msg.id):
+                    recovered = await self._recover_actionable_backlog()
+                    if self._stopped:
+                        return ResyncOutcome.STOPPED
+                    if revision != self._control_revision:
+                        return ResyncOutcome.BLOCKED
+                    if not recovered:
+                        return ResyncOutcome.RETRY
+                    return (
+                        ResyncOutcome.WORK
+                        if self._resync_handled_work
+                        else ResyncOutcome.BLOCKED
+                    )
                 if result is BacklogProcessResult.NO_PROGRESS:
                     skipped.add(next_msg.id)
         except Exception:
