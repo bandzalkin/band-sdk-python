@@ -64,6 +64,7 @@ from band.runtime.context_serialization import context_item_to_dict
 from band.runtime.cycle import TurnScope
 from band.runtime.formatters import build_participants_message, format_history_for_llm
 from band.runtime.participants import log_roster_call, log_roster_error
+from band.runtime.resync_backoff import IdleResyncBackoff
 from band.runtime.tools.agent import AgentTools
 from band.runtime.types import (
     ConversationContext,
@@ -379,6 +380,11 @@ class ExecutionContext:
         # idle /next polling and short-circuits WS triggers while stopped to
         # avoid /next->204 and mark->204/reply->403 churn. Not persisted.
         self._stopped: bool = False
+
+        # Phase 2's idle /next interval for this room (see resync_backoff).
+        self._idle_resync = IdleResyncBackoff(
+            self.config.idle_resync_seconds, self.config.idle_resync_max_seconds
+        )
 
         # Optional seam for clearing user-visible activity state ("reasoning…")
         # when a cycle is interrupted/stopped. Filled by the activity-signal
@@ -1172,7 +1178,7 @@ class ExecutionContext:
                     # race on the Windows Proactor loop). asyncio.timeout() arms a
                     # timer on the current task instead, so an external cancel
                     # propagates directly into `queue.get()`.
-                    async with asyncio.timeout(self.config.idle_resync_seconds):
+                    async with asyncio.timeout(self._idle_resync.next_wait()):
                         event = await self.queue.get()
                 except TimeoutError:
                     if self._stopped:
@@ -1183,11 +1189,14 @@ class ExecutionContext:
                         )
                         continue
                     logger.debug(
-                        "ExecutionContext %s: Idle for %ss, re-polling /next",
+                        "ExecutionContext %s: Idle for up to %ss, re-polling /next",
                         self.room_id,
-                        self.config.idle_resync_seconds,
+                        self._idle_resync.level,
                     )
+                    resets = self._idle_resync.resets
                     await self._wait_until_resync_complete()
+                    if self._idle_resync.resets == resets:
+                        self._idle_resync.found_nothing()
                     continue
 
                 if isinstance(event, ResyncRequest):
@@ -1206,6 +1215,10 @@ class ExecutionContext:
                     )
                     await self._wait_until_resync_complete()
                     continue
+
+                # Any event queued for this room means it is active: poll at the
+                # base interval again.
+                self._idle_resync.reset()
 
                 while True:
                     try:
@@ -1619,6 +1632,11 @@ class ExecutionContext:
                     msg_id,
                 )
                 return BacklogProcessResult.RETRY_LATER
+
+            # A claimed backlog message is one a push should have delivered:
+            # keep this room polling at the base interval. A head the agent
+            # skips without running is not traffic.
+            self._idle_resync.reset()
 
             # Hydrate context on first message (loads participants always,
             # history only if enable_context_hydration is True)

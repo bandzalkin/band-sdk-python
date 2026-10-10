@@ -3,7 +3,8 @@
 Covers:
 - request_resync() enqueues ResyncRequest sentinel
 - Sentinel wakes Phase 2 loop and calls _resync_pending_messages()
-- Idle timeout calls _resync_pending_messages() after configured seconds
+- Idle timeout calls _resync_pending_messages() within the configured interval
+- Idle polls are jittered and back off while they find nothing to run
 - _resync_pending_messages() happy path: processes missed message
 - _resync_pending_messages() empty path: /next returns None, no error
 - AgentRuntime._on_reconnected() calls request_resync() on all executions
@@ -21,6 +22,7 @@ import pytest
 
 from band.runtime.execution import ExecutionContext, ResyncRequest
 from band.runtime.presence import RoomPresence
+from band.runtime.resync_backoff import IdleResyncBackoff
 from band.runtime.runtime import AgentRuntime
 from band.runtime.types import PlatformMessage, SessionConfig
 from tests.conftest import make_message_event
@@ -31,8 +33,7 @@ from tests.runtime.conftest import admit_room, wait_for_condition
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def mock_link():
+def make_mock_link():
     """BandLink mock configured for ExecutionContext tests."""
     link = MagicMock()
     link.agent_id = "agent-123"
@@ -64,6 +65,7 @@ def mock_link():
     link.mark_failed = AsyncMock()
     link.get_next_message = AsyncMock(return_value=None)
     link.get_stale_processing_messages = AsyncMock(return_value=[])
+    link.report_activity = AsyncMock(return_value=True)
 
     async def empty_aiter():
         return
@@ -72,6 +74,11 @@ def mock_link():
     link.__aiter__ = lambda self: empty_aiter()
 
     return link
+
+
+@pytest.fixture
+def mock_link():
+    return make_mock_link()
 
 
 @pytest.fixture
@@ -157,7 +164,7 @@ class TestIdleTimeout:
     """Tests for idle-timeout resync in Phase 2 loop."""
 
     async def test_idle_timeout_triggers_resync(self, mock_link, mock_handler):
-        """Phase 2 should call /next after idle_resync_seconds with no WS events."""
+        """Phase 2 should call /next within idle_resync_seconds with no WS events."""
         config = SessionConfig(idle_resync_seconds=0.01)  # fast timeout for test
         ctx = ExecutionContext("room-1", mock_link, mock_handler, config=config)
         await ctx.start()
@@ -192,6 +199,173 @@ class TestIdleTimeout:
         assert mock_link.get_next_message.call_count == call_count_after_phase1
 
         await ctx.stop()
+
+
+# ---------------------------------------------------------------------------
+# TestIdleResyncBackoff
+# ---------------------------------------------------------------------------
+
+
+class TestIdleResyncBackoffPolicy:
+    """The idle /next interval: jittered, doubling while polls find nothing."""
+
+    def test_wait_is_jittered_within_the_upper_half_of_the_interval(self):
+        low = IdleResyncBackoff(60, 300, random=lambda: 0.0)
+        high = IdleResyncBackoff(60, 300, random=lambda: 1.0)
+
+        assert low.next_wait() == 30
+        assert high.next_wait() == 60
+
+    def test_empty_polls_double_the_interval_up_to_the_cap(self):
+        backoff = IdleResyncBackoff(60, 300, random=lambda: 1.0)
+
+        waits = []
+        for _ in range(5):
+            waits.append(backoff.next_wait())
+            backoff.found_nothing()
+
+        assert waits == [60, 120, 240, 300, 300]
+
+    def test_reset_returns_to_the_base_interval(self):
+        backoff = IdleResyncBackoff(60, 300, random=lambda: 1.0)
+        backoff.found_nothing()
+        backoff.found_nothing()
+
+        backoff.reset()
+
+        assert backoff.next_wait() == 60
+
+    def test_cap_below_the_base_interval_keeps_the_base(self):
+        backoff = IdleResyncBackoff(600, 300, random=lambda: 1.0)
+        backoff.found_nothing()
+
+        assert backoff.next_wait() == 600
+
+
+class TestIdleResyncBackoffLoop:
+    """Phase 2 applies the backoff to its idle /next polls."""
+
+    async def test_empty_idle_polls_back_off_to_the_cap(self, mock_link, mock_handler):
+        config = SessionConfig(idle_resync_seconds=0.01, idle_resync_max_seconds=0.04)
+        ctx = ExecutionContext("room-1", mock_link, mock_handler, config=config)
+        await ctx.start()
+
+        # Phase 1 sync, then the 0.01 -> 0.02 -> 0.04 polls.
+        await wait_for_condition(
+            lambda: mock_link.get_next_message.call_count >= 5, timeout=2.0
+        )
+
+        assert ctx._idle_resync.level == 0.04
+        await ctx.stop()
+
+    async def test_backed_off_room_polls_less_often(self, mock_link, mock_handler):
+        # Without backoff 0.05 s polls make at least ~20 calls in a second;
+        # doubling to 0.4 s leaves well under ten.
+        config = SessionConfig(idle_resync_seconds=0.05, idle_resync_max_seconds=0.4)
+        ctx = ExecutionContext("room-1", mock_link, mock_handler, config=config)
+        await ctx.start()
+
+        await asyncio.sleep(1.0)
+
+        assert mock_link.get_next_message.call_count < 10
+        await ctx.stop()
+
+    async def test_idle_waits_use_the_jittered_draw(self, mock_handler, monkeypatch):
+        # Record the deadline the room's own loop arms while it waits for a
+        # push: it must be the jittered draw, not the bare interval.
+        real_timeout = asyncio.timeout
+        waits = {}
+        for draw in (0.0, 1.0):
+            config = SessionConfig(idle_resync_seconds=0.1, idle_resync_max_seconds=0.1)
+            ctx = ExecutionContext(
+                "room-1", make_mock_link(), mock_handler, config=config
+            )
+            ctx._idle_resync = IdleResyncBackoff(0.1, 0.1, random=lambda d=draw: d)
+            armed = asyncio.Queue()
+
+            def recording_timeout(delay, ctx=ctx, armed=armed):
+                if asyncio.current_task() is ctx._process_loop_task:
+                    armed.put_nowait(delay)
+                return real_timeout(delay)
+
+            monkeypatch.setattr(asyncio, "timeout", recording_timeout)
+            await ctx.start()
+            waits[draw] = await asyncio.wait_for(armed.get(), timeout=2.0)
+            await ctx.stop()
+
+        assert waits == {0.0: 0.05, 1.0: 0.1}
+
+    async def test_websocket_message_resets_the_interval(self, mock_link, mock_handler):
+        config = SessionConfig(idle_resync_seconds=0.01, idle_resync_max_seconds=0.04)
+        ctx = ExecutionContext("room-1", mock_link, mock_handler, config=config)
+        # Read when the pushed message is handled: later idle polls in this
+        # quiet room grow the interval again.
+        levels = []
+        mock_handler.side_effect = lambda *_: levels.append(ctx._idle_resync.level)
+        await ctx.start()
+        await wait_for_condition(lambda: ctx._idle_resync.level == 0.04, timeout=2.0)
+
+        await ctx.on_event(make_message_event(room_id="room-1", msg_id="msg-ws"))
+        await wait_for_condition(lambda: mock_handler.await_count >= 1)
+
+        assert levels == [0.01]
+        await ctx.stop()
+
+    async def test_poll_that_finds_a_missed_message_keeps_the_base_interval(
+        self, mock_link, mock_handler
+    ):
+        calls = 0
+
+        async def next_message(room_id):
+            # Phase 1 finds nothing; afterwards every idle poll finds one
+            # missed message before the backlog is empty again.
+            nonlocal calls
+            calls += 1
+            if calls > 1 and calls % 2 == 0:
+                return make_platform_message(msg_id=f"missed-{calls}", room_id=room_id)
+            return None
+
+        mock_link.get_next_message.side_effect = next_message
+        config = SessionConfig(idle_resync_seconds=0.01, idle_resync_max_seconds=0.04)
+        ctx = ExecutionContext("room-1", mock_link, mock_handler, config=config)
+        # Record the interval each wait is drawn from, which the loop decides
+        # only after the whole poll has finished.
+        levels = []
+        backoff = ctx._idle_resync
+        draw = backoff.next_wait
+
+        def recording_next_wait():
+            levels.append(backoff.level)
+            return draw()
+
+        backoff.next_wait = recording_next_wait
+        await ctx.start()
+
+        await wait_for_condition(lambda: len(levels) >= 4, timeout=2.0)
+
+        assert levels[:4] == [0.01] * 4
+        await ctx.stop()
+
+    async def test_poll_offered_only_a_message_it_cannot_run_still_backs_off(
+        self, mock_link, mock_handler
+    ):
+        # A head the agent will never run is not traffic: the room is as
+        # quiet as one whose /next is empty.
+        stuck = make_platform_message(msg_id="msg-failed", room_id="room-1")
+        mock_link.get_next_message.return_value = stuck
+        config = SessionConfig(idle_resync_seconds=0.01, idle_resync_max_seconds=0.04)
+        ctx = ExecutionContext("room-1", mock_link, mock_handler, config=config)
+        ctx._retry_tracker.mark_permanently_failed("msg-failed")
+        await ctx.start()
+
+        await wait_for_condition(lambda: ctx._idle_resync.level == 0.04, timeout=2.0)
+
+        mock_handler.assert_not_called()
+        await ctx.stop()
+
+    def test_rejects_a_non_positive_cap(self):
+        with pytest.raises(ValueError, match="idle_resync_max_seconds"):
+            SessionConfig(idle_resync_max_seconds=0)
 
 
 # ---------------------------------------------------------------------------
