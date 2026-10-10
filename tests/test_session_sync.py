@@ -391,4 +391,3 @@ class TestCrashRecovery:
         assert await ctx._synchronize_with_next()
 
         ctx._handler_mock.assert_not_called()
-
