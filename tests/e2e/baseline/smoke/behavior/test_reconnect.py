@@ -46,7 +46,7 @@ async def test_room_survives_real_transport_reconnect(
     Proof that ``_on_reconnected`` itself ran comes from a spy wrapping
     ``link._drain_reconciliation``, not from the message round-trip alone:
     a room's ``ExecutionContext`` also carries an independent
-    ``idle_resync_seconds`` REST re-poll (default 60s) with no relationship
+    ``idle_resync_seconds`` REST re-poll (60 s, backing off to 300 s) with no relationship
     to WebSocket reconnect at all, so a reply arriving after the disconnect
     does not by itself prove the reconnect path executed — it could equally
     be explained by that unrelated fallback quietly picking up the slack
