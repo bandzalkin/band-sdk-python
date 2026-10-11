@@ -461,7 +461,10 @@ async def test_stop_between_control_discovery_and_claim_prevents_provider_effect
 
     def stopped_control_gate(request: Any) -> Any:
         response = peer.answer(request)
-        if request.url.path.endswith("/messages"):
+        if (
+            request.url.path.endswith("/messages")
+            and request.url.params.get("status") != "processing"
+        ):
             peer.stopped = True
         return response
 
