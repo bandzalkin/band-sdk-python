@@ -33,9 +33,10 @@ Each upstream pull request is one squashed commit whose message ends with an
 | [#760](https://github.com/band-ai/band-sdk-python/pull/760) | A message claim the platform refuses because the room is stopped adopts the stop instead of running the turn; `ExecutionContext.claim_message` gives hosts claiming into a running turn the same handling. | #713, and #730: the fork's stale recovery already drains one actionable snapshot that ends once the room is stopped, so #760's sweep and sync guards are dropped and its stale-claim test feeds that snapshot. Carried as three commits (the PR at 896d186f, then what it gained by c4feff21 and by e513d4d0), each with its trailer; fold them on the next rebuild of the branch. |
 | [#761](https://github.com/band-ai/band-sdk-python/pull/761) | A room's idle `/next` poll is jittered and doubles while it finds nothing to run, up to `SessionConfig.idle_resync_max_seconds` (300 s), so an agent in many quiet rooms no longer polls each one every minute, all at once. | #731: the pushed-event reset sits before Phase 2's `TurnDeferred` retry loop. #730: the stuck-head test stubs the actionable snapshot that a skipped head hands the drain to. |
 | [#762](https://github.com/band-ai/band-sdk-python/pull/762) | A room whose ACP session setup fails (other than a configuration error) retires its agent process, so the next message reaches a fresh one instead of a process that keeps refusing sessions; a setup another turn started meanwhile keeps the process. | upstream `main`; applies cleanly over #731, whose busy deferrals are raised from the prompt loop, not from session setup. |
+| [#763](https://github.com/band-ai/band-sdk-python/pull/763) | OMP sessions receive guidance to use native `wait` for required background work and deliver the completed result or failure through Band before ending the turn. This is an instruction-based mitigation, not an async lifecycle barrier. | upstream `main`; applies cleanly over the existing patch set. |
 
-The last fork-only commit adds this file and the replay workflow. It has no trailer and is
-always replayed.
+The fork-only commit that adds this file and the replay workflow has no trailer
+and is always replayed.
 
 `CHANGELOG.md` is not part of the patch set. Release Please rewrites its head on every
 upstream release, so carrying entries there would break the weekly replay for no benefit.
