@@ -16,10 +16,10 @@ from band_sdk_core import ClaimRegistry
 
 from band.client.streaming import ControlMode
 from band.platform.event import PlatformEvent
-
-from .execution import Execution, ExecutionContext, ExecutionHandler
-from .presence import RoomPresence
-from .types import (
+from band.runtime.cycle import TurnScope
+from band.runtime.execution import Execution, ExecutionContext, ExecutionHandler
+from band.runtime.presence import RoomPresence
+from band.runtime.types import (
     ParticipantAddedCallback,
     ParticipantRemovedCallback,
     SessionConfig,
@@ -101,6 +101,8 @@ class AgentRuntime:
         session_config: SessionConfig | None = None,
         on_session_cleanup: Callable[[str], Awaitable[None]] | None = None,
         on_control: Callable[[str, ControlMode], Awaitable[None]] | None = None,
+        on_message_control: Callable[[ExecutionContext, PlatformEvent], Awaitable[bool]]
+        | None = None,
         on_participant_added: ParticipantAddedCallback | None = None,
         on_participant_removed: ParticipantRemovedCallback | None = None,
     ):
@@ -129,6 +131,7 @@ class AgentRuntime:
         self._session_config = session_config or SessionConfig()
         self._on_session_cleanup = on_session_cleanup
         self._on_control = on_control
+        self._on_message_control = on_message_control
         self._on_participant_added = on_participant_added
         self._on_participant_removed = on_participant_removed
 
@@ -413,12 +416,14 @@ class AgentRuntime:
                 room_id=room_id,
                 link=self.link,
                 on_execute=self._on_execute,
+                on_message_control=self._on_message_control,
                 config=self._session_config,
                 agent_id=self.agent_id,
                 on_participant_added=self._on_participant_added,
                 on_participant_removed=self._on_participant_removed,
                 hub_room_id=self._hub_room_id,
                 claim_registry=self._claim_registry,
+                on_platform_stop=self._on_platform_stop,
             )
 
         self.executions[room_id] = execution
@@ -426,6 +431,10 @@ class AgentRuntime:
 
         logger.debug("Created execution for room %s", room_id)
         return execution
+
+    async def _on_platform_stop(self, ctx: ExecutionContext, scope: TurnScope) -> None:
+        if ctx.owns_scope(scope) and self._on_control is not None:
+            await self._on_control(ctx.room_id, ControlMode.STOP)
 
     async def _destroy_execution(
         self, room_id: str, timeout: float | None = None
