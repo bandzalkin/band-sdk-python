@@ -1175,7 +1175,14 @@ class ExecutionContext:
                         # Local events have no REST delivery for /next to replay.
                         # Keep their FIFO position until accepted or shut down.
                         await asyncio.sleep(self.config.idle_resync_seconds)
-                        while self._stopped:
+                        while True:
+                            deadline = self._resync_schedule.due_at
+                            if deadline is not None and deadline <= loop.time():
+                                # Discover missed PLAY without letting REST work
+                                # overtake the retained local event.
+                                await self._reconcile(defer_backlog=True)
+                            if not self._stopped:
+                                break
                             await asyncio.sleep(self.config.idle_resync_seconds)
 
         except asyncio.CancelledError:
@@ -1191,16 +1198,18 @@ class ExecutionContext:
                 return False
         return True
 
-    async def _reconcile(self) -> None:
+    async def _reconcile(self, *, defer_backlog: bool = False) -> None:
         # Requests received after this pass starts retain their own sentinel.
         self._pending_resync = None
-        outcome = await self._wait_until_resync_complete()
+        outcome = await self._wait_until_resync_complete(defer_backlog=defer_backlog)
         self._resync_schedule.complete(
             asyncio.get_running_loop().time(),
             empty=outcome is ResyncOutcome.EMPTY and not self._stopped,
         )
 
-    async def _wait_until_resync_complete(self) -> ResyncOutcome:
+    async def _wait_until_resync_complete(
+        self, *, defer_backlog: bool = False
+    ) -> ResyncOutcome:
         """Preserve recovery ordering while allowing stopped-room discovery."""
         handled_work = False
         while True:
@@ -1220,6 +1229,9 @@ class ExecutionContext:
                     return ResyncOutcome.STOPPED
                 self._resume_room()
                 revision = self._control_revision
+
+            if defer_backlog:
+                return ResyncOutcome.BLOCKED
 
             if await self._retry_pending_processed_acks():
                 if revision != self._control_revision:
@@ -1247,8 +1259,6 @@ class ExecutionContext:
             "ExecutionContext %s: Starting /next synchronization", self.room_id
         )
 
-        previous_id: str | None = None
-        skipped: set[str] = set()
         try:
             sync_marker = self._first_ws_msg_id
             # Recover a complete ordered snapshot before newer processing work.
@@ -1263,13 +1273,6 @@ class ExecutionContext:
                 next_msg = await self._get_next_message()
                 if revision != self._control_revision:
                     return self._stopped
-                if (
-                    next_msg is not None
-                    and next_msg.id == previous_id
-                    and self._backlog_is_nonrunnable(next_msg)
-                ):
-                    break
-                previous_id = next_msg.id if next_msg is not None else None
 
                 if next_msg is None:
                     logger.debug(
@@ -1280,22 +1283,13 @@ class ExecutionContext:
                     return True
 
                 if self._backlog_message_is_skipped(next_msg):
-                    await self._process_backlog_message(next_msg)
+                    await self._process_backlog_message(next_msg, revision=revision)
                     synchronized = await self._recover_actionable_backlog(
                         sync_to_websocket=True
                     )
                     if synchronized:
                         self._sync_complete = True
                     return synchronized
-
-                if next_msg.id in skipped:
-                    logger.warning(
-                        "ExecutionContext %s: /next re-returned message %s "
-                        "already skipped in this drain; ending sync",
-                        self.room_id,
-                        next_msg.id,
-                    )
-                    break
 
                 at_sync_point = next_msg.id == self._first_ws_msg_id
                 level = logging.INFO if at_sync_point else logging.DEBUG
@@ -1318,8 +1312,6 @@ class ExecutionContext:
                     return True
                 if at_sync_point:
                     return False
-                if result == BacklogProcessResult.NO_PROGRESS:
-                    skipped.add(next_msg.id)
 
                 if self._stopped:
                     # A stop control signal landed mid-cycle: the message was
@@ -1373,6 +1365,8 @@ class ExecutionContext:
         """Drain one complete FIFO snapshot without re-polling a retained /next head."""
         revision = self._control_revision
         messages = await self.link.get_actionable_messages(self.room_id)
+        if revision != self._control_revision:
+            return False
         for msg in messages:
             if self._stopped:
                 return True
@@ -1437,8 +1431,6 @@ class ExecutionContext:
     ) -> ResyncOutcome:
         """Drain actionable work, distinguishing empty from blocked recovery."""
         self._resync_handled_work = False
-        previous_id: str | None = None
-        skipped: set[str] = set()
         try:
             while True:
                 revision = self._control_revision
@@ -1467,14 +1459,6 @@ class ExecutionContext:
                         if self._resync_handled_work
                         else ResyncOutcome.BLOCKED
                     )
-                if next_msg.id in skipped:
-                    return ResyncOutcome.BLOCKED
-                if (
-                    next_msg.id == previous_id
-                    and self._backlog_is_nonrunnable(next_msg)
-                ) or self._retry_tracker.is_permanently_failed(next_msg.id):
-                    return ResyncOutcome.BLOCKED
-                previous_id = next_msg.id
                 result = await self._process_backlog_message(
                     next_msg, revision=revision
                 )
@@ -1497,8 +1481,6 @@ class ExecutionContext:
                         if self._resync_handled_work
                         else ResyncOutcome.BLOCKED
                     )
-                if result is BacklogProcessResult.NO_PROGRESS:
-                    skipped.add(next_msg.id)
         except Exception:
             logger.exception(
                 "ExecutionContext %s: Error during /next resync", self.room_id
