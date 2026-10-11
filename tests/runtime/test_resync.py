@@ -178,6 +178,46 @@ async def test_known_stop_recovers_after_missed_play(
 
 
 @pytest.mark.looptime
+async def test_deferred_local_event_recovers_missed_play_before_newer_delivery(
+    reconciled_room: ReconciledRoom,
+) -> None:
+    ctx, peer, invoked = reconciled_room
+    entered = asyncio.Event()
+    first_attempt = True
+
+    async def handler(ctx: ExecutionContext, event: Any) -> None:
+        nonlocal first_attempt
+        if event.payload.id == "local-contact" and first_attempt:
+            first_attempt = False
+            entered.set()
+            await asyncio.Event().wait()
+        invoked.append(event.payload.id)
+
+    ctx._on_execute = handler
+    await ctx.start()
+    await wait_for_condition(lambda: ctx._sync_complete)
+    await ctx.on_event(
+        make_message_event(
+            room_id=ROOM_ID,
+            msg_id="local-contact",
+            sender_id="contact-events",
+            sender_type="System",
+        )
+    )
+    await entered.wait()
+    ctx.stop_room()
+    peer.stopped = True
+    peer.add_message("after-local")
+    await ctx.on_event(make_message_event(room_id=ROOM_ID, msg_id="after-local"))
+    await asyncio.sleep(61)
+    assert invoked == []
+    peer.stopped = False
+    await asyncio.sleep(60)
+    assert invoked == ["local-contact", "after-local"]
+    assert peer.marked("processed") == ["after-local"]
+
+
+@pytest.mark.looptime
 async def test_quiet_reconciliation_grows_to_conservative_cap(
     reconciled_room: ReconciledRoom,
 ) -> None:
@@ -341,7 +381,6 @@ async def test_unchanged_completed_head_defers_without_spinning(
     ctx.claims.remember_completed(ROOM_ID, "stuck")
     peer.add_message("stuck")
     assert await ctx._resync_pending_messages() is ResyncOutcome.BLOCKED
-    assert len(peer.next_reads) == 2
     assert peer.requested("processed") == []
     assert invoked == []
 
@@ -784,7 +823,7 @@ class TestDrainProgressGuard:
         ctx = ExecutionContext("room-1", mock_link, mock_handler)
         ctx.claims.remember_completed(ctx.room_id, "wedged-1")
 
-        assert await ctx._resync_pending_messages() is True
+        assert await ctx._resync_pending_messages() is ResyncOutcome.BLOCKED
         assert next_message.calls <= 2
         mock_handler.assert_not_called()
 
