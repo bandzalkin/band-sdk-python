@@ -176,7 +176,11 @@ class LifecyclePlatform:
             if request.url.params.get("status") == "processing":
                 self.processing_list_reads += 1
                 return httpx.Response(
-                    200, json={"data": self.messages, "metadata": {"total_pages": 1}}
+                    200,
+                    json={
+                        "data": [],
+                        "metadata": {"total_pages": 1, "has_more": False, "limit": 100},
+                    },
                 )
             cursor = request.url.params.get("cursor")
             self.actionable_cursors.append(cursor)
