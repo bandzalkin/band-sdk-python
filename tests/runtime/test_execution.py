@@ -2070,7 +2070,11 @@ class TestExhaustedHeadRecovery:
         async with asyncio.timeout(1):
             if phase == "bootstrap":
                 return await ctx._synchronize_with_next()
-            return await ctx._resync_pending_messages()
+            return await ctx._resync_pending_messages() in {
+                ResyncOutcome.EMPTY,
+                ResyncOutcome.WORK,
+                ResyncOutcome.BLOCKED,
+            }
 
     @pytest.mark.parametrize("trigger", ["exhausted", "stale"])
     async def test_snapshot_hands_off_at_websocket_marker(self, backlog, trigger):

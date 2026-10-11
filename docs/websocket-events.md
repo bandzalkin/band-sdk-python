@@ -38,6 +38,11 @@ STOP, PLAY or INTERRUPT controls invalidate obsolete recovery results. A 204
 response preserves the local pause because it cannot distinguish stopped from
 empty rooms.
 
+Local events have no REST delivery to replay. If a local turn is deferred, its
+queue position is retained while due stopped-room probes can discover a missed
+PLAY. These probes do not dispatch newer REST work before the local event is
+accepted; newer queued events remain behind it.
+
 Failed requests, refused claims and pending acknowledgements retain the base
 retry cadence. A completed or skipped head that cannot advance ends the pass
 without spinning; retryable handler failures retain their normal attempt budget.
