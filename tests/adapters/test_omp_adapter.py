@@ -561,9 +561,11 @@ async def test_a_blocked_resolution_does_not_hold_another_room(
     launches: Launches, tmp_path: Path
 ):
     release = asyncio.Event()
+    slow_entered = asyncio.Event()
 
     async def resolve(workspace: str):
         if workspace.endswith("slow"):
+            slow_entered.set()
             await release.wait()
         return {}
 
@@ -587,11 +589,14 @@ async def test_a_blocked_resolution_does_not_hold_another_room(
         )
 
     slow = asyncio.create_task(turn("slow"))
+    await asyncio.wait_for(slow_entered.wait(), 1)  # slow is now inside its resolver
     await asyncio.wait_for(turn("fast"), 1)
 
-    assert not slow.done() and len(launches.runtimes) == 1
+    assert not release.is_set() and not slow.done()  # fast finished while slow blocked
+    assert len(launches.runtimes) == 1
     release.set()
     await asyncio.wait_for(slow, 1)
+    assert len(launches.runtimes) == 2
     await adapter.cleanup_all()
 
 
