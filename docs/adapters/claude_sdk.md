@@ -101,7 +101,9 @@ reuse the failed client or take another room's claimed directory.
     few builtin classes (such as `LookupError` or `OSError`); they never read
     an exception's own name or module, and never carry callback values,
     credentials or native error text, even for a `ClaudeMcpStartupError` the
-    callback raised.
+    callback raised, or when the check of a held client's servers is what
+    fails, with or without a resolver. Such a failure never starts the room's
+    session again without its history.
   - External tools stay under `permission_mode` and `approvals`; they are never
     added to the tool allowlist.
 - **A starting connection is owned until it settles.** Callers for a room share

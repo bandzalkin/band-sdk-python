@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
+from band.adapters.claude_sdk import ClaudeSDKAdapter
 from band.integrations.claude_sdk.mcp_startup import ClaudeMcpStartupError
 from band.integrations.claude_sdk.session_manager import (
     ClaudeSessionManager,
@@ -726,3 +727,84 @@ async def test_the_reuse_decision_is_a_plain_bool_by_the_final_guard(
         await manager.stop()
     assert len(claude.sessions) == sessions_before
     assert not manager.owns_resources()
+
+
+class RaisingTruth:
+    """Stands in for a held client whose currentness comparison answers with
+    the client itself and whose truth test raises a secret-bearing error of a
+    builtin type, as a callback-computed step could."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.reads = 0
+        self.options = ClaudeAgentOptions(mcp_servers=dict(BAND))
+
+    def __eq__(self, other: object) -> Any:
+        return self
+
+    def __bool__(self) -> bool:
+        self.reads += 1
+        raise LookupError(self.text)
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize("with_resolver", [True, False])
+async def test_a_failing_reuse_decision_stays_a_safe_non_resume_failure(
+    tmp_path: Path,
+    claude: FakeClaude,
+    caplog: pytest.LogCaptureFixture,
+    with_resolver: bool,
+) -> None:
+    """A truth test that raises while the reuse decision is worked out is a
+    reservation failure the owner built, with or without a resolver: its text
+    carries no callback value, and the adapter never retries the room without
+    its history."""
+    holder: dict[str, RaisingTruth] = {}
+    secret = "res-ul3t-9a7c"
+
+    def band(room_id: str) -> Any:
+        return holder.get("probe", BAND)
+
+    async def resolver(workspace: str) -> Mapping[str, Any]:
+        return {}
+
+    manager = ClaudeSessionManager(
+        ClaudeAgentOptions(),
+        mcp_servers_factory=band,
+        workspaces=RoomWorkspaces(lambda room_id: str(tmp_path / room_id)),
+        resolve_mcp_servers=resolver if with_resolver else None,
+    )
+    calls: list[str | None] = []
+    original = manager.get_or_create_session
+
+    async def counted(
+        room_id: str, *, resume_session_id: str | None = None
+    ) -> ClaudeSDKClient:
+        calls.append(resume_session_id)
+        return await original(room_id, resume_session_id=resume_session_id)
+
+    manager.get_or_create_session = counted  # type: ignore[method-assign]
+    claude.mcp_statuses.append([{"name": BAND_MCP_SERVER_NAME, "status": "connected"}])
+    try:
+        first = await manager.get_or_create_session("room-a")
+        assert first is not None
+        probe = holder["probe"] = RaisingTruth(secret)
+        manager._sessions["room-a"] = probe
+        calls.clear()  # only the adapter's own attempt counts
+        # The decision's truth test runs inside the fallible boundary; the
+        # branch test after the callback-free guard reads the settled bool.
+        with (
+            caplog.at_level(logging.WARNING),
+            pytest.raises(ClaudeMcpStartupError) as caught,
+        ):
+            await ClaudeSDKAdapter._open_session(manager, "room-a", "hist-1")
+    finally:
+        manager._sessions.pop("room-a", None)
+        await manager.stop()
+    assert probe.reads == 1, f"the decision was read {probe.reads} times"
+    error = caught.value
+    assert error.stage == "reservation" and not error.resume_eligible
+    assert secret not in str(error)
+    assert secret not in caplog.text
+    assert calls == ["hist-1"], "the room's session was started again without history"

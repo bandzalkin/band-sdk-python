@@ -440,11 +440,19 @@ class ClaudeSessionManager:
         protected: Any = None
         try:
             client = self._sessions.get(room_id)
-            reusable = bool(
-                client is not None
-                and room_id not in self._unusable
-                and self._is_current(room_id, client)
-            )
+            try:
+                # The held client and the comparison are the callback's own
+                # objects: whatever their truth test raises is a safe failure,
+                # in every configuration, not a raw error to fall back on.
+                reusable = bool(
+                    client is not None
+                    and room_id not in self._unusable
+                    and self._is_current(room_id, client)
+                )
+            except Exception as error:  # noqa: BLE001 -- untrusted by construction
+                raise startup_error(
+                    "reservation", "the room's session could not be reserved", error
+                ) from None
             if not reusable:
                 if self._workspaces is not None:
                     self._workspaces.claim(room_id)
