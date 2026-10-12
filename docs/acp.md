@@ -206,14 +206,23 @@ text/image tool results.
   when external servers (or their credentials) can change while the adapter runs.
   It is called once for each new room process, with the room's claimed workspace,
   before the overlay or process exists; the same result feeds both the overlay and
-  the startup receipt check. Its result is the room's complete external server set:
-  it replaces `mcp_servers`, an empty mapping means none, and an exception fails
-  that startup with no fallback to `mcp_servers`. A reused room process never calls
-  it again; a retired room (cancellation, failure, or cleanup) resolves afresh on its
-  next start. The name `band` is reserved, because OMP would mint that server's tools
-  under Band tool names. The callable is runtime-only and never part of
-  `OmpAdapterConfig`. Cleanup cancels a room that is still resolving, and a resolver
-  that returns after its room was cancelled cannot launch it.
+  the startup receipt check. Its result is the room's complete **external** server
+  set: it replaces every external entry in `mcp_servers` (an empty mapping means
+  none), and an exception fails that startup with no fallback to them. A `band`
+  entry in `mcp_servers` is the SDK's own Band endpoint, not an external server: it
+  is kept beside the resolved set, so Band tools still route through it with
+  `inject_band_tools=False`. The resolver itself may not return `band`, because OMP
+  would mint that server's tools under Band tool names. A reused room process never
+  calls it again; a retired room (cancellation, failure, or cleanup) resolves afresh
+  on its next start. The callable is runtime-only and never part of
+  `OmpAdapterConfig`.
+- **Room retirement.** Cleanup cancels a room's running turn, including one still
+  resolving, and turns already waiting for that room stand down rather than starting
+  a new process; a resolver that returns after its room was cancelled cannot launch
+  it. A room whose native close fails keeps its process handle, overlay and
+  exclusive workspace claim until a later close succeeds: `on_cleanup` raises the
+  failure, `cleanup_all` and the room's next turn retry the close, and the retiring
+  process never receives new work.
 - **Permissions.** `approval_mode="yolo"` bypasses native approval checks without
   changing Band platform permissions. Otherwise `resolve_permission` receives
   `OmpPermissionRequest(room_id, session_id, title, options)` and returns an

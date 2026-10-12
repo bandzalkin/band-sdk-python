@@ -370,12 +370,14 @@ class Launches:
     def __init__(self) -> None:
         self.runtimes: list[PendingRuntime] = []
         self.servers: list[dict[str, object]] = []
+        self.plugins: list[Path] = []
         self.spawned = asyncio.Event()
 
     def __call__(self, command, **_kwargs):
         plugin = command[command.index("--plugin-dir") + 1]
         overlay = json.loads((Path(plugin) / ".mcp.json").read_text(encoding="utf-8"))
         self.servers.append(overlay["mcpServers"])
+        self.plugins.append(Path(plugin))
         runtime = PendingRuntime()
         runtime.finish.set()
         self.runtimes.append(runtime)
@@ -672,4 +674,163 @@ async def test_a_restored_session_survives_a_resolved_connection(
         PendingRuntime.request = original  # type: ignore[method-assign]
 
     assert "switch_session" in requests
+    await adapter.cleanup_all()
+
+
+class BandMcpReplyRuntime(PendingRuntime):
+    """Replies through the Band MCP server mounted in the overlay, not a host tool."""
+
+    async def prompt(self, _message, *, on_event, on_tool, on_ui):
+        name = "mcp__band_sdk_band_send_message"
+        args = {"content": "done"}
+        await on_event(
+            OmpEvent(
+                type="tool_execution_start", toolCallId="c1", toolName=name, args=args
+            )
+        )
+        await on_event(
+            OmpEvent(
+                type="tool_execution_end", toolCallId="c1", toolName=name, isError=False
+            )
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("external", [{}, {"linear": remote("grant-A")}])
+async def test_the_configured_band_endpoint_survives_any_resolved_external_set(
+    tmp_path: Path, monkeypatch, external
+):
+    overlays: list[dict[str, object]] = []
+
+    def spawn(command, **_kwargs):
+        plugin = Path(command[command.index("--plugin-dir") + 1])
+        overlays.append(json.loads((plugin / ".mcp.json").read_text(encoding="utf-8")))
+        return BandMcpReplyRuntime()
+
+    ready = AsyncMock()
+    monkeypatch.setattr("band.adapters.omp.OmpRpcClient", spawn)
+    monkeypatch.setattr("band.adapters.omp.omp_mcp_ready", ready)
+    band = OmpMcpServer(type="http", url="http://127.0.0.1:9/band")
+    adapter = OmpAdapter(
+        OmpAdapterConfig(
+            cwd=str(tmp_path),
+            inject_band_tools=False,
+            mcp_servers={"band": band, "stale": remote("old")},
+        ),
+        resolve_mcp_servers=AsyncMock(return_value=external),
+        emit=(),
+    )
+    tools = FakeAgentTools()
+
+    await run_turn(adapter, tools)
+
+    expected = {"band", *external}
+    (overlay,) = overlays
+    assert set(overlay["mcpServers"]) == expected  # the cached external entry is gone
+    assert overlay["mcpServers"]["band"]["url"] == "http://127.0.0.1:9/band"
+    assert set(ready.await_args.args[2]) == expected
+    assert tools.turn.replied  # Band's reply tool still routes through its own server
+    await adapter.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_settles_a_turn_queued_behind_a_blocked_resolution(
+    launches: Launches, tmp_path: Path
+):
+    entered = asyncio.Event()
+    calls = 0
+    blocking = True
+
+    async def resolve(_workspace: str):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        if blocking:
+            await asyncio.Event().wait()
+        return {}
+
+    adapter = OmpAdapter(
+        OmpAdapterConfig(cwd=str(tmp_path)), resolve_mcp_servers=resolve, emit=()
+    )
+    first = asyncio.create_task(run_turn(adapter, FakeAgentTools()))
+    await asyncio.wait_for(entered.wait(), 1)
+    blocking = False  # anything that resolves from here on would launch
+    queued = asyncio.create_task(run_turn(adapter, FakeAgentTools()))
+    for _ in range(5):
+        await asyncio.sleep(0)  # the second turn now waits on the room lock
+
+    await asyncio.wait_for(adapter.cleanup_all(), 1)
+
+    assert first.done() and queued.done()
+    assert calls == 1 and launches.runtimes == []
+    assert not adapter._workspaces.rooms
+    for task in (first, queued):
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    await run_turn(adapter, FakeAgentTools())  # a later explicit turn recovers
+    assert calls == 2 and len(launches.runtimes) == 1
+    await adapter.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_native_close_keeps_the_room_owned_until_cleanup_succeeds(
+    launches: Launches, tmp_path: Path
+):
+    shared = str(tmp_path)
+    adapter = OmpAdapter(workspace_for_room=lambda _room: shared, emit=())
+    await run_turn(adapter, FakeAgentTools())
+    (retiring,) = launches.runtimes
+    (overlay,) = launches.plugins
+    close_calls = 0
+
+    async def close():
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 1:
+            raise OSError("the process could not be reaped")
+        retiring.closed = True
+
+    retiring.close = close  # type: ignore[method-assign]
+
+    with pytest.raises(OSError, match="reaped"):
+        await adapter.on_cleanup("room-123")
+
+    assert "room-123" in adapter._rooms and overlay.exists()
+    with pytest.raises(ValueError):
+        adapter._workspaces.claim(
+            "other-room"
+        )  # the workspace is still exclusively held
+    await adapter.cleanup_all()
+    assert close_calls == 2 and retiring.closed
+    assert not adapter._rooms and not overlay.exists() and not adapter._workspaces.rooms
+    await run_turn(adapter, FakeAgentTools())
+    assert len(launches.runtimes) == 2  # a fresh process, never the retiring one
+    await adapter.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_after_a_failed_close_never_reuses_the_retiring_process(
+    launches: Launches, tmp_path: Path
+):
+    adapter = OmpAdapter(OmpAdapterConfig(cwd=str(tmp_path)), emit=())
+    await run_turn(adapter, FakeAgentTools())
+    (retiring,) = launches.runtimes
+    prompts = 0
+    original_prompt = retiring.prompt
+
+    async def counted_prompt(*args, **kwargs):
+        nonlocal prompts
+        prompts += 1
+        return await original_prompt(*args, **kwargs)
+
+    retiring.prompt = counted_prompt  # type: ignore[method-assign]
+    retiring.close = AsyncMock(side_effect=[OSError("busy"), None])  # type: ignore[method-assign]
+    with pytest.raises(OSError):
+        await adapter.on_cleanup("room-123")
+
+    await run_turn(adapter, FakeAgentTools())
+
+    assert prompts == 0  # the retiring process got no new work
+    assert retiring.close.await_count == 2  # its cleanup was retried first
+    assert len(launches.runtimes) == 2
     await adapter.cleanup_all()

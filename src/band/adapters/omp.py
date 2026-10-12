@@ -153,6 +153,7 @@ class OmpRoom:
     session_id: str = ""
     session_file: str | None = None
     bootstrapped: bool = False
+    retiring: bool = False
 
 
 @dataclass
@@ -197,6 +198,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         self._locks: dict[str, asyncio.Lock] = {}
         self._owners: dict[str, asyncio.Task[object]] = {}
         self._room_selections: dict[str, ModelSelection] = {}
+        self._retirements: dict[str, int] = {}
         self._resolve_mcp_servers = resolve_mcp_servers
         self._host_schemas = self._build_host_tools()
 
@@ -291,6 +293,11 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                 raise ValueError(
                     f"MCP server name {BAND_MCP_SERVER_NAME!r} is reserved for Band tools"
                 )
+        protected = self.config.mcp_servers.get(BAND_MCP_SERVER_NAME)
+        if protected is not None:
+            # The configured Band endpoint is the SDK's own channel, not an external
+            # server, so it is kept beside whatever external set was resolved.
+            servers = {BAND_MCP_SERVER_NAME: protected, **servers}
         return MappingProxyType(servers)
 
     async def _open_room(self, room_id: str, history: OmpSessionState) -> OmpRoom:
@@ -388,7 +395,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
     ) -> None:
         async with self._locks.setdefault(room_id, asyncio.Lock()):
             room = self._rooms.get(room_id)
-            if room is not None:
+            if room is not None and not room.retiring:
                 await self._select_model(room, selection)
             self._room_selections[room_id] = selection
 
@@ -469,14 +476,22 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
+        retirement = self._retirements.get(room_id, 0)
         async with self._locks.setdefault(room_id, asyncio.Lock()):
+            if self._retirements.get(room_id, 0) != retirement:
+                # The room was retired while this turn waited for it.
+                raise asyncio.CancelledError
             owner = asyncio.current_task()
             if owner is not None:
                 self._owners[room_id] = owner
             deadline = asyncio.timeout(self.config.turn_timeout_s)
             try:
                 async with deadline:
-                    room = self._rooms.get(room_id) or await self._open_room(
+                    room = self._rooms.get(room_id)
+                    if room is not None and room.retiring:
+                        await self._close_room(room_id)  # finish its earlier retirement
+                        room = None
+                    room = room or await self._open_room(
                         room_id, history if is_session_bootstrap else OmpSessionState()
                     )
                     prompt = await self._prompt_text(
@@ -524,13 +539,13 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                         },
                     )
             except asyncio.CancelledError:
-                await self._close_room(room_id)
+                await self._retire_after_failure(room_id)
                 raise
             except DeliveryFailedError as error:
-                await self._close_room(room_id)
+                await self._retire_after_failure(room_id)
                 reraise_delivery_cause(error)
             except Exception:
-                await self._close_room(room_id)
+                await self._retire_after_failure(room_id)
                 logger.exception("OMP turn failed in room %s", room_id)
                 failure = (
                     AgentFailure(
@@ -701,17 +716,29 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                     )
 
     async def _close_room(self, room_id: str) -> None:
-        room = self._rooms.pop(room_id, None)
+        """Retire a room's process, keeping the room, its overlay and its workspace
+        claim owned until the close succeeds: a failed close can be retried, and
+        nothing else can take the workspace or reuse the process meanwhile."""
+        room = self._rooms.get(room_id)
+        if room is not None:
+            room.retiring = True
+            await room.runtime.close()
+            del self._rooms[room_id]
+            room.resources.close()
+        self._workspaces.release(room_id)
+
+    async def _retire_after_failure(self, room_id: str) -> None:
         try:
-            if room is not None:
-                try:
-                    await room.runtime.close()
-                finally:
-                    room.resources.close()
-        finally:
-            self._workspaces.release(room_id)
+            await self._close_room(room_id)
+        except Exception:
+            logger.exception(
+                "OMP room %s could not be closed; it stays owned until cleanup", room_id
+            )
 
     async def on_cleanup(self, room_id: str) -> None:
+        # Turns already queued on the room lock see the new retirement and stand
+        # down instead of resolving, writing an overlay or spawning a process.
+        self._retirements[room_id] = self._retirements.get(room_id, 0) + 1
         owner = self._owners.get(room_id)
         if owner is not None and owner is not asyncio.current_task():
             owner.cancel()
