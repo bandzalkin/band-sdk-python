@@ -1146,3 +1146,155 @@ async def test_cleanup_all_joins_a_retirement_with_no_room_or_turn_left(
     room_lock.release()
     await asyncio.wait_for(asyncio.gather(retirement, shutdown), 1)
     assert launches.runtimes == []
+
+
+class SwallowingResolver:
+    """Catches a cancellation at its first await and returns a server anyway."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self, _workspace: str):
+        self.calls += 1
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass
+        return {"linear": remote("late")}
+
+
+@pytest.mark.asyncio
+async def test_a_cancellation_pending_at_entry_launches_nothing(
+    launches: Launches, tmp_path: Path
+):
+    resolver = SwallowingResolver()
+    adapter = OmpAdapter(
+        OmpAdapterConfig(cwd=str(tmp_path)), resolve_mcp_servers=resolver, emit=()
+    )
+
+    async def caller():
+        asyncio.current_task().cancel()  # requested, not yet delivered
+        await run_turn(adapter, FakeAgentTools())
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.create_task(caller())
+
+    assert resolver.calls == 0 and launches.runtimes == []
+    assert not adapter._workspaces.rooms and not adapter._owners
+    await run_turn(adapter, FakeAgentTools())  # explicit recovery
+    assert len(launches.runtimes) == 1
+    await adapter.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_a_cancellation_handled_before_entry_does_not_stop_the_turn(
+    launches: Launches, tmp_path: Path
+):
+    resolver = SwallowingResolver()
+    adapter = OmpAdapter(
+        OmpAdapterConfig(cwd=str(tmp_path)), resolve_mcp_servers=resolver, emit=()
+    )
+
+    async def caller():
+        asyncio.current_task().cancel()
+        try:
+            await asyncio.sleep(0)  # delivered and handled by the caller itself
+        except asyncio.CancelledError:
+            pass
+        await run_turn(adapter, FakeAgentTools())
+
+    await asyncio.create_task(caller())
+
+    assert resolver.calls == 1 and len(launches.runtimes) == 1
+    await adapter.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_before_the_deadline_owns_the_turn_through_slow_settlement(
+    launches: Launches, tmp_path: Path
+):
+    resolver = SettlingResolver()
+    adapter, releases = settling_adapter(tmp_path, resolver, turn_timeout_s=0.2)
+    tools = FakeAgentTools()
+    first = asyncio.create_task(run_turn(adapter, tools))
+    await asyncio.wait_for(resolver.entered.wait(), 1)
+    cleanup = asyncio.create_task(adapter.on_cleanup("room-123"))
+    await asyncio.wait_for(resolver.cancel_seen.wait(), 1)
+
+    # Settlement outlives the configured deadline; that deadline must not fire now.
+    await asyncio.sleep(0.4)
+
+    assert resolver.cancellations == 1 and not cleanup.done()
+    assert "room-123" in adapter._workspaces.rooms
+    resolver.settle.set()
+    await asyncio.wait_for(cleanup, 1)
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert resolver.cancellations == 1 and releases and all(releases)
+    assert not reported_failures(tools) and launches.runtimes == []
+    await run_turn(adapter, FakeAgentTools())  # explicit recovery
+    assert len(launches.runtimes) == 1
+    await adapter.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_retirement_never_cancels_work_after_the_captured_turn_finished(
+    tmp_path: Path, monkeypatch
+):
+    adapter = OmpAdapter(OmpAdapterConfig(cwd=str(tmp_path)), emit=())
+    unrelated = asyncio.Event()
+    continued = asyncio.Event()
+    runtime = PendingRuntime()
+    monkeypatch.setattr("band.adapters.omp.OmpRpcClient", lambda *a, **k: runtime)
+
+    async def caller():
+        await run_turn(adapter, FakeAgentTools())
+        await unrelated.wait()  # the caller's own work after its turn
+        continued.set()
+
+    wrapper = asyncio.create_task(caller())
+    await asyncio.wait_for(runtime.yielded.wait(), 1)
+    # Cleanup captures the live turn; the turn then finishes before retirement runs.
+    cleanup = asyncio.create_task(adapter.on_cleanup("room-123"))
+    runtime.finish.set()
+    await asyncio.wait_for(cleanup, 1)
+
+    assert not wrapper.cancelled() and not wrapper.done()
+    assert runtime.closed and not adapter._workspaces.rooms
+    unrelated.set()
+    await asyncio.wait_for(wrapper, 1)
+    assert continued.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_joins_outcome_handling_after_the_deadline_context_exited(
+    launches: Launches, tmp_path: Path, monkeypatch
+):
+    closing = asyncio.Event()
+    finish_close = asyncio.Event()
+
+    class FailingRuntime(PendingRuntime):
+        async def prompt(self, *_args, **_kwargs):
+            raise RuntimeError("native turn failed")
+
+        async def close(self):
+            closing.set()
+            await finish_close.wait()
+            self.closed = True
+
+    runtime = FailingRuntime()
+    monkeypatch.setattr("band.adapters.omp.OmpRpcClient", lambda *a, **k: runtime)
+    adapter = OmpAdapter(OmpAdapterConfig(cwd=str(tmp_path)), emit=())
+    tools = FakeAgentTools()
+    turn = asyncio.create_task(run_turn(adapter, tools))
+    await asyncio.wait_for(closing.wait(), 1)  # the turn is handling its own failure
+
+    cleanup = asyncio.create_task(adapter.on_cleanup("room-123"))
+    assert await not_done_within(cleanup)
+    finish_close.set()
+    await asyncio.wait_for(cleanup, 1)
+
+    with pytest.raises(RuntimeError, match="native turn failed"):
+        await turn
+    assert [failure["provider"] for failure in reported_failures(tools)] == ["omp"]
+    assert runtime.closed and not adapter._workspaces.rooms

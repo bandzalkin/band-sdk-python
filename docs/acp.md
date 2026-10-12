@@ -218,21 +218,28 @@ text/image tool results.
   `OmpAdapterConfig`.
 - **Room retirement.** `on_cleanup` starts one retirement per room, and overlapping
   `on_cleanup` and `cleanup_all` calls join it. The room's active turn is the
-  current `on_message` call, not the task that made it. Retirement marks that turn
-  retired, so nothing it resolves afterwards can start a process, and cancels it
-  once, unless it is already handling a cancellation, its deadline or its outcome,
-  in which case retirement joins that instead and the original timeout or
-  cancellation result and failure report stand. It then waits for that call's own
-  finalization (not for the rest of its caller's work), and only then closes the
-  process and releases the workspace. A turn may request cleanup of its own room,
-  for example from its resolver: that call returns at once, the turn stops before
-  launching, and teardown follows its settlement. Cancelling a cleanup call stops
-  only that caller's wait. Until the retirement ends, turns already waiting for the
-  room and turns that arrive during it are cancelled rather than starting a new
-  process. A later turn starts normally. A room whose native close fails keeps its
-  process handle, overlay and exclusive workspace claim until a later close
-  succeeds: `on_cleanup` raises the failure, `cleanup_all` and the room's next turn
-  retry the close first, and the retiring process never receives new work.
+  current `on_message` call, not the task that made it. A cancellation already
+  requested when that call starts is delivered at its first step, before anything
+  is resolved or launched; one its caller had already received and handled does
+  not stop it. Retirement marks the active turn retired, so nothing it resolves
+  afterwards can start a process. While the turn is still running, retirement
+  becomes the cause of its end: it disarms the turn deadline if that has not fired,
+  so the deadline cannot cancel the turn's settlement again, and cancels the turn
+  once, or joins a cancellation it is already handling. A turn whose deadline has
+  fired, or that is already handling its own outcome, keeps its timeout or other
+  result and its failure report. A turn that has already finished is never
+  cancelled, so its caller's later work is untouched. Retirement then waits for
+  that call's own finalization (not for the rest of its caller's work), and only
+  then closes the process and releases the workspace. A turn may request cleanup of
+  its own room, for example from its resolver: that call returns at once, the turn
+  stops before launching, and teardown follows its settlement. Cancelling a cleanup
+  call stops only that caller's wait. Until the retirement ends, turns already
+  waiting for the room and turns that arrive during it are cancelled rather than
+  starting a new process. A later turn starts normally. A room whose native close
+  fails keeps its process handle, overlay and exclusive workspace claim until a
+  later close succeeds: `on_cleanup` raises the failure, `cleanup_all` and the
+  room's next turn retry the close first, and the retiring process never receives
+  new work.
 - **Permissions.** `approval_mode="yolo"` bypasses native approval checks without
   changing Band platform permissions. Otherwise `resolve_permission` receives
   `OmpPermissionRequest(room_id, session_id, title, options)` and returns an

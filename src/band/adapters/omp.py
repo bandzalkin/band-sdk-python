@@ -175,8 +175,10 @@ class _ActiveTurn:
     settled: asyncio.Event = field(default_factory=asyncio.Event)
     retired: bool = False  # retirement claimed the room; nothing may launch now
     ending: bool = False  # already handling its outcome; must not be interrupted
+    # The turn deadline while its context is entered; None before and after.
+    deadline: asyncio.Timeout | None = None
     # A caller task may carry cancellations it handled earlier; only newer ones
-    # belong to this invocation.
+    # belong to this invocation. Fixed once the admission checkpoint has passed.
     baseline: int = field(init=False)
 
     def __post_init__(self) -> None:
@@ -185,11 +187,21 @@ class _ActiveTurn:
     def cancel_requested(self) -> bool:
         return self.task.cancelling() > self.baseline
 
-    def interruptible(self) -> bool:
-        """Whether cancelling now would start, not interrupt, its settlement:
-        a turn already handling a cancellation, its deadline, or its outcome is
-        joined instead."""
-        return not self.ending and not self.cancel_requested()
+    def take_over(self) -> None:
+        """Make retirement the cause of this still-running invocation's end.
+
+        A settled or outcome-handling invocation is left alone, and so is a fired
+        deadline. Otherwise the live deadline is disarmed so it cannot cancel the
+        settlement a second time, and the task is cancelled unless a cancellation
+        is already being handled, which is joined instead.
+        """
+        if self.settled.is_set() or self.ending:
+            return
+        timer = self.deadline
+        if timer is not None and not timer.expired():
+            timer.reschedule(None)
+        if not self.cancel_requested():
+            self.task.cancel()
 
 
 class OmpAdapter(SimpleAdapter[OmpSessionState]):
@@ -521,7 +533,15 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
             self._owners[room_id] = active
             deadline = asyncio.timeout(self.config.turn_timeout_s)
             try:
+                # A cancellation requested before this call is delivered here, inside
+                # its cleanup ownership and before any resolver or launch; only a
+                # count that survives this checkpoint was handled earlier.
+                await asyncio.sleep(0)
+                if active.retired:
+                    raise asyncio.CancelledError
+                active.baseline = task.cancelling()
                 async with deadline:
+                    active.deadline = deadline
                     room = self._rooms.get(room_id)
                     if room is not None and room.retiring:
                         await self._close_room(room_id)  # finish its earlier retirement
@@ -573,6 +593,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                             "omp_session_file": room.session_file,
                         },
                     )
+                active.deadline = None
             except asyncio.CancelledError:
                 active.ending = True
                 await self._retire_after_failure(room_id)
@@ -820,8 +841,8 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         requester: asyncio.Task[object] | None,
     ) -> None:
         if active is not None:
-            if active.task is not requester and active.interruptible():
-                active.task.cancel()  # once; every later cleanup joins this retirement
+            if active.task is not requester and self._owners.get(room_id) is active:
+                active.take_over()
             # The invocation's own finalization, not its caller's whole lifetime.
             await active.settled.wait()
         async with self._locks.setdefault(room_id, asyncio.Lock()):
