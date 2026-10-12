@@ -90,14 +90,27 @@ def startup_error(
 ) -> ClaudeMcpStartupError:
     """A fresh safe error for ``error``, whatever its type; raise it ``from
     None`` so the original text, which may hold credentials, never joins the
-    chain."""
+    chain. The error's type is named only when it is a builtin or comes from a
+    library this adapter runs: a callback can name its own classes anything."""
     return _OwnedStartupError(
         stage,
         reason,
         server=server,
-        error_type=None if error is None else type(error).__name__,
+        error_type=_known_type_name(error),
         resume_eligible=resume_eligible,
     )
+
+
+_KNOWN_ERROR_MODULES = ("builtins", "asyncio", "claude_agent_sdk", "anyio", "band")
+
+
+def _known_type_name(error: BaseException | None) -> str | None:
+    if error is None:
+        return None
+    module = type(error).__module__
+    if module.split(".")[0] in _KNOWN_ERROR_MODULES:
+        return type(error).__name__
+    return None
 
 
 def is_safe_startup_error(error: BaseException) -> bool:
@@ -123,13 +136,21 @@ def freeze_external_servers(
 
 
 def _copy_servers(resolved: object) -> dict[str, object]:
-    """Plain JSON values copied out of the callback's result. No callback code
-    runs after this returns."""
+    """Plain JSON values copied out of the callback's result.
+
+    Every operation on the callback's objects -- the type check, iterating its
+    items, unpacking each item, reading and serializing each config -- runs
+    callback code, so any exception from one of them, whatever its type, is
+    replaced by a safe error. Only exact ``str`` names and plain copies leave;
+    no callback code runs after this returns.
+    """
+    pairs: list[tuple[object, object]] | None = None
     try:
-        if not isinstance(resolved, Mapping):
-            pairs = None
-        else:
-            pairs = list(resolved.items())
+        if isinstance(resolved, Mapping):
+            pairs = []
+            for item in resolved.items():
+                name, config = item
+                pairs.append((name, config))
     except Exception as error:  # noqa: BLE001 -- untrusted, whatever its type
         raise startup_error(
             "resolution", "the resolved servers could not be read", error
@@ -140,14 +161,17 @@ def _copy_servers(resolved: object) -> dict[str, object]:
         )
     copied: dict[str, object] = {}
     for name, config in pairs:
-        # Exactly ``str``: a subclass could render itself however it likes.
+        # Exactly ``str`` (checked without calling into it): a subclass could
+        # render or compare itself however it likes.
         if type(name) is not str or not name:
             raise startup_error("resolution", "server names must be strings")
+        if name in copied:
+            raise startup_error("resolution", "duplicate server name", server=name)
         try:
-            if not isinstance(config, Mapping):
-                copied[name] = _NOT_A_MAPPING
-                continue
-            copied[name] = json.loads(json.dumps(dict(config)))
+            if isinstance(config, Mapping):
+                plain: object = json.loads(json.dumps(dict(config)))
+            else:
+                plain = _NOT_A_MAPPING
         except (TypeError, ValueError) as error:
             raise startup_error(
                 "resolution", "server config is not serializable", error, server=name
@@ -159,6 +183,7 @@ def _copy_servers(resolved: object) -> dict[str, object]:
                 error,
                 server=name,
             ) from None
+        copied[name] = plain
     return copied
 
 
@@ -176,6 +201,10 @@ def _validate(
                 "resolution", "server config must be a mapping", server=name
             )
         kind = config.get("type", "stdio")
+        if not isinstance(kind, str):
+            raise startup_error(
+                "resolution", "server type must be a string", server=name
+            )
         if kind == "sdk":
             raise startup_error(
                 "resolution", "in-process sdk servers are not supported", server=name

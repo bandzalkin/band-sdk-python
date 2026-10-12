@@ -502,3 +502,76 @@ async def test_a_close_failure_reports_no_native_text(
     finally:
         session.close = real_close  # type: ignore[method-assign]
         await manager.stop()
+
+
+class FailingBand:
+    """A protected-server factory that can be made to fail, with a secret."""
+
+    def __init__(self) -> None:
+        self.failing = False
+
+    def __call__(self, room_id: str) -> dict[str, Any]:
+        if self.failing:
+            raise LookupError(f"band backend said {SECRET}")
+        return dict(BAND)
+
+
+@pytest.mark.parametrize("retained", ["file", "child"])
+async def test_a_failed_reservation_keeps_what_the_room_still_holds(
+    tmp_path: Path,
+    claude: FakeClaude,
+    caplog: pytest.LogCaptureFixture,
+    retained: str,
+) -> None:
+    resolver = CountingResolver()
+    band = FailingBand()
+    claude.mcp_statuses.append([{"name": BAND_MCP_SERVER_NAME, "status": "connected"}])
+    manager = ClaudeSessionManager(
+        ClaudeAgentOptions(),
+        mcp_servers_factory=band,
+        workspaces=RoomWorkspaces(lambda room_id: str(tmp_path / room_id)),
+        resolve_mcp_servers=resolver,
+    )
+    await manager.get_or_create_session("room-a")
+    path = Path(str(claude.sessions[0].options.mcp_servers))
+    try:
+        # The room's cleanup fails, leaving its file (or its whole child) held.
+        if retained == "file":
+            path.parent.chmod(0o500)
+        else:
+            claude.refuse_close = True
+        with pytest.raises(ClaudeMcpStartupError, match="cleanup"):
+            await manager.cleanup_session("room-a", release_workspace=False)
+        if retained == "file":
+            path.parent.chmod(0o700)
+        else:
+            claude.refuse_close = False
+
+        band.failing = True
+        with (
+            caplog.at_level(logging.DEBUG),
+            pytest.raises(ClaudeMcpStartupError) as caught,
+        ):
+            await manager.get_or_create_session("room-a")
+        assert caught.value.stage == "reservation"
+        assert SECRET not in str(caught.value) and SECRET not in caplog.text
+        # Nothing new was resolved, allocated or spawned, and the old custody
+        # is still owned.
+        assert len(resolver.calls) == 1
+        assert len(claude.sessions) == 1
+        assert path.exists()
+        assert manager.owns_resources()
+
+        band.failing = False
+        await manager.cleanup_session("room-a")
+        assert not path.exists()
+        assert not manager.owns_resources()
+        await manager.get_or_create_session("room-a")
+        assert len(claude.sessions) == 2
+    finally:
+        if path.parent.exists():
+            path.parent.chmod(0o700)
+        claude.refuse_close = False
+        band.failing = False
+        await manager.stop()
+    assert not manager.owns_resources()

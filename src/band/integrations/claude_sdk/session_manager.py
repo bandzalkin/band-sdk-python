@@ -434,35 +434,50 @@ class ClaudeSessionManager:
             startup.waiters += 1
             return startup
 
-        stale: tuple[Any, Any, Any] = (None, None, None)
-        if (client := self._sessions.get(room_id)) is not None:
-            if room_id not in self._unusable and self._is_current(room_id, client):
+        # Everything that can fail -- the room's workspace claim and the
+        # protected-server factory -- runs while the room's previous custody
+        # stays registered where it is.
+        try:
+            client = self._sessions.get(room_id)
+            if (
+                client is not None
+                and room_id not in self._unusable
+                and self._is_current(room_id, client)
+            ):
                 logger.debug("Reusing existing session for room: %s", room_id)
                 return client
+            if self._workspaces is not None:
+                self._workspaces.claim(room_id)
+            protected = self._protected_identity(room_id)
+        except Exception as error:
+            if self._resolve_mcp_servers is None:
+                raise
+            raise startup_error(
+                "reservation", "the room's session could not be reserved", error
+            ) from None
+        if client is not None:
             logger.info("Replacing unusable or outdated session for room %s", room_id)
-        if client is not None or room_id in self._config_files:
-            # The replacement owns whatever the room still holds -- a client, or
-            # only a file an earlier cleanup could not remove: its worker closes
-            # it through the queue, and must succeed, before resolving or
-            # allocating anything new. Nothing here awaits.
-            stale = self._take_session(room_id)
-
         if resume_session_id:
             logger.info("Resuming session %s for room: %s", resume_session_id, room_id)
         else:
             logger.info("Creating new ClaudeSDKClient session for room: %s", room_id)
-        if self._workspaces is not None:
-            self._workspaces.claim(room_id)
         startup = RoomStartup(
             room_id=room_id,
             resume_session_id=resume_session_id,
-            protected=self._protected_identity(room_id),
+            protected=protected,
             result=asyncio.get_running_loop().create_future(),
             waiters=1,
-            stale_client=stale[0],
-            stale_transport=stale[1],
-            stale_config_file=stale[2],
         )
+        # From here to registration nothing can fail or call out: the startup
+        # takes over whatever the room still holds -- a client, or only a file
+        # an earlier cleanup could not remove -- and its worker must close it,
+        # through the queue, before resolving or allocating anything new.
+        if client is not None or room_id in self._config_files:
+            (
+                startup.stale_client,
+                startup.stale_transport,
+                startup.stale_config_file,
+            ) = self._take_session(room_id)
         self._startups[room_id] = startup
         startup.worker = asyncio.create_task(
             self._run_startup(startup), name=f"claude-startup:{room_id}"

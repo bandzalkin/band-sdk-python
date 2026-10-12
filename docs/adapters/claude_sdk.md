@@ -89,15 +89,17 @@ reuse the failed client or take another room's claimed directory.
     turn with `ClaudeMcpStartupError` and never resumes without the room's
     history; only the CLI itself failing to start (a session that can't be
     resumed, for one) is retried as a fresh session, which resolves again.
-  - Band's server is added separately; the name `band` and in-process `sdk`
-    servers are refused by name. The servers reach the CLI only as the path of a
+  - Band's server is added separately; the name `band`, in-process `sdk`
+    servers, names that aren't plain strings and a `type` that isn't a string
+    are refused by name. The servers reach the CLI only as the path of a
     private file (directory `0700`, file `0600`), never on its command line, and
     the file stays until the CLI's exit is confirmed and the file is removed.
   - The session is used only after every server, Band's included, reports
     `connected` through the CLI's `mcp_status`; anything else within 30 seconds
     (each status request included) fails the turn. Errors and logs name the
-    stage, server and exception type, never callback values, credentials or
-    native error text -- even for a `ClaudeMcpStartupError` the callback raised.
+    stage, server and, for builtin or library errors, the exception type --
+    never callback values, credentials or native error text, even for a
+    `ClaudeMcpStartupError` the callback raised.
   - External tools stay under `permission_mode` and `approvals`; they are never
     added to the tool allowlist.
 - **A starting connection is owned until it settles.** Callers for a room share

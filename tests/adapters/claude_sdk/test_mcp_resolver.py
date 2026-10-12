@@ -755,3 +755,91 @@ def test_the_resolver_type_needs_no_claude_sdk_at_import() -> None:
         "McpServerResolver | None\n"
     )
     subprocess.run([sys.executable, "-c", probe], check=True)
+
+
+def item_failure(kind: str) -> BaseException:
+    if kind == "ordinary":
+        return LookupError(f"vault said {GRANT_A}")
+    if kind == "marked":
+        return startup_error("launch", f"token {GRANT_A}", resume_eligible=True)
+    # A callback-defined exception whose very class name carries the secret.
+    return type(f"Leak_{GRANT_A.replace('-', '_')}", (Exception,), {})()
+
+
+class BadItem(tuple):
+    """A ``(name, config)`` item that fails when unpacked."""
+
+    failure: BaseException
+
+    def __iter__(self) -> Any:
+        raise self.failure
+
+
+class HostileItems(Mapping[str, Any]):
+    """A mapping whose items fail only once a caller unpacks them."""
+
+    def __init__(self, failure: BaseException) -> None:
+        self.failure = failure
+
+    def __getitem__(self, key: str) -> Any:
+        return {"type": "stdio", "command": "tool"}
+
+    def __iter__(self) -> Any:
+        return iter(["tool"])
+
+    def __len__(self) -> int:
+        return 1
+
+    def items(self) -> Any:
+        item = BadItem(("tool", {"type": "stdio", "command": "tool"}))
+        item.failure = self.failure
+        return [item]
+
+
+@pytest.mark.parametrize("kind", ["ordinary", "marked", "named-class"])
+async def test_an_item_that_fails_when_unpacked_is_untrusted(
+    claude_room: OpenRoom,
+    claude: FakeClaude,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    before = private_files()
+    calls: list[str] = []
+
+    async def resolver(workspace: str) -> Mapping[str, Any]:
+        calls.append(workspace)
+        return HostileItems(item_failure(kind))
+
+    room = await claude_room(resolve_mcp_servers=resolver)
+    with caplog.at_level(logging.DEBUG), pytest.raises(ClaudeMcpStartupError) as caught:
+        await room.send("hi", session_id="sess-earlier")
+
+    assert caught.value.stage == "resolution"
+    assert not caught.value.resume_eligible
+    assert len(calls) == 1
+    assert claude.sessions == []
+    assert_secret_free(GRANT_A, caught.value, caplog.text)
+    assert_secret_free(GRANT_A.replace("-", "_"), caught.value, caplog.text)
+    await room.leave()
+    assert private_files() == before
+    assert not room.adapter._session_manager.owns_resources()
+
+
+@pytest.mark.parametrize("kind", [[], {}, 3, None], ids=["list", "dict", "int", "null"])
+async def test_a_non_string_server_type_is_refused_by_name(
+    claude_room: OpenRoom, claude: FakeClaude, kind: Any
+) -> None:
+    calls: list[str] = []
+
+    async def resolver(workspace: str) -> Mapping[str, Any]:
+        calls.append(workspace)
+        return {"tool": {"type": kind, "command": "tool", "url": "http://x"}}
+
+    room = await claude_room(resolve_mcp_servers=resolver)
+    with pytest.raises(ClaudeMcpStartupError, match="type must be a string") as caught:
+        await room.send("hi", session_id="sess-earlier")
+
+    assert caught.value.server == "tool"
+    assert not caught.value.resume_eligible
+    assert len(calls) == 1
+    assert claude.sessions == []
