@@ -1298,3 +1298,85 @@ async def test_cleanup_joins_outcome_handling_after_the_deadline_context_exited(
         await turn
     assert [failure["provider"] for failure in reported_failures(tools)] == ["omp"]
     assert runtime.closed and not adapter._workspaces.rooms
+
+
+class SelfRetiringResolver(SettlingResolver):
+    """On its first cancellation it asks for its own room's cleanup, then holds
+    its settlement until released."""
+
+    adapter: OmpAdapter
+
+    async def __call__(self, workspace: str):
+        self.calls += 1
+        if self.calls > 1:
+            return {}
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancellations += 1
+            await self.adapter.on_cleanup("room-123")  # returns at once for self
+            self.cancel_seen.set()
+            try:
+                await self.settle.wait()
+            except asyncio.CancelledError:
+                self.cancellations += 1
+                raise
+            self.settled = True
+            raise
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_self_cleanup_after_a_caller_cancellation_disarms_the_deadline(
+    launches: Launches, tmp_path: Path
+):
+    resolver = SelfRetiringResolver()
+    adapter, releases = settling_adapter(tmp_path, resolver, turn_timeout_s=0.2)
+    resolver.adapter = adapter
+    tools = FakeAgentTools()
+    first = asyncio.create_task(run_turn(adapter, tools))
+    await asyncio.wait_for(resolver.entered.wait(), 1)
+    first.cancel()  # the caller cancels; the resolver then retires its own room
+    await asyncio.wait_for(resolver.cancel_seen.wait(), 1)
+    shutdown = asyncio.create_task(adapter.cleanup_all())
+
+    # Settlement outlives the configured deadline; that deadline must not fire now.
+    await asyncio.sleep(0.4)
+
+    assert resolver.cancellations == 1 and not first.done() and not shutdown.done()
+    assert "room-123" in adapter._workspaces.rooms
+    resolver.settle.set()
+    await asyncio.wait_for(shutdown, 1)
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert resolver.cancellations == 1 and releases and all(releases)
+    assert not reported_failures(tools) and launches.runtimes == []
+    await run_turn(adapter, FakeAgentTools())  # explicit recovery
+    assert len(launches.runtimes) == 1
+    await adapter.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_self_cleanup_after_the_deadline_keeps_the_timeout_report(
+    launches: Launches, tmp_path: Path
+):
+    resolver = SelfRetiringResolver()
+    adapter, releases = settling_adapter(tmp_path, resolver, turn_timeout_s=0.05)
+    resolver.adapter = adapter
+    tools = FakeAgentTools()
+    first = asyncio.create_task(run_turn(adapter, tools))
+    await asyncio.wait_for(resolver.cancel_seen.wait(), 1)  # the deadline fired first
+
+    resolver.settle.set()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(first, 1)
+    await asyncio.wait_for(adapter.cleanup_all(), 1)
+
+    assert resolver.cancellations == 1 and resolver.settled
+    assert releases and all(releases)
+    assert [
+        (failure["provider"], failure.get("code"))
+        for failure in reported_failures(tools)
+    ] == [("omp", "timeout")]
+    assert launches.runtimes == []

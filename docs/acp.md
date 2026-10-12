@@ -232,7 +232,8 @@ text/image tool results.
   that call's own finalization (not for the rest of its caller's work), and only
   then closes the process and releases the workspace. A turn may request cleanup of
   its own room, for example from its resolver: that call returns at once, the turn
-  stops before launching, and teardown follows its settlement. Cancelling a cleanup
+  is not cancelled again but its unfired deadline is disarmed all the same, it stops
+  before launching, and teardown follows its settlement. Cancelling a cleanup
   call stops only that caller's wait. Until the retirement ends, turns already
   waiting for the room and turns that arrive during it are cancelled rather than
   starting a new process. A later turn starts normally. A room whose native close

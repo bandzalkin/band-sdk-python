@@ -187,20 +187,30 @@ class _ActiveTurn:
     def cancel_requested(self) -> bool:
         return self.task.cancelling() > self.baseline
 
-    def take_over(self) -> None:
+    def running(self) -> bool:
+        """Neither settled nor already handling its own outcome."""
+        return not self.settled.is_set() and not self.ending
+
+    def retire_deadline(self) -> None:
+        """Disarm the deadline of a running invocation whose end retirement now
+        owns, so it cannot cancel the settlement a second time. A fired deadline,
+        or one whose context has exited, is never touched."""
+        timer = self.deadline
+        if self.running() and timer is not None and not timer.expired():
+            timer.reschedule(None)
+
+    def take_over(self, *, cancel: bool) -> None:
         """Make retirement the cause of this still-running invocation's end.
 
         A settled or outcome-handling invocation is left alone, and so is a fired
-        deadline. Otherwise the live deadline is disarmed so it cannot cancel the
-        settlement a second time, and the task is cancelled unless a cancellation
-        is already being handled, which is joined instead.
+        deadline. The live deadline is disarmed for every retirement; the task is
+        cancelled only when ``cancel`` allows it (never for a turn that requested
+        its own retirement) and no cancellation is already being handled.
         """
-        if self.settled.is_set() or self.ending:
+        if not self.running():
             return
-        timer = self.deadline
-        if timer is not None and not timer.expired():
-            timer.reschedule(None)
-        if not self.cancel_requested():
+        self.retire_deadline()
+        if cancel and not self.cancel_requested():
             self.task.cancel()
 
 
@@ -821,6 +831,9 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         active = self._owners.get(room_id)
         if active is not None:
             active.retired = True
+            # Retirement owns the turn's end from here, including when the turn
+            # requested it itself: its unfired deadline must not cancel again.
+            active.retire_deadline()
         operation = asyncio.create_task(
             self._retire(room_id, active, asyncio.current_task())
         )
@@ -841,8 +854,8 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         requester: asyncio.Task[object] | None,
     ) -> None:
         if active is not None:
-            if active.task is not requester and self._owners.get(room_id) is active:
-                active.take_over()
+            if self._owners.get(room_id) is active:
+                active.take_over(cancel=active.task is not requester)
             # The invocation's own finalization, not its caller's whole lifetime.
             await active.settled.wait()
         async with self._locks.setdefault(room_id, asyncio.Lock()):
