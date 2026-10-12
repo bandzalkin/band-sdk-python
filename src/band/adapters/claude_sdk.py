@@ -106,12 +106,17 @@ from band.integrations.claude_sdk.dedup_tools import (
     DEFAULT_DEDUP_TTL_SECONDS,
     DedupingAgentTools,
 )
+from band.integrations.claude_sdk.mcp_startup import (
+    ClaudeMcpStartupError,
+    McpServerResolver,
+)
 from band.integrations.claude_sdk.prompts import generate_claude_sdk_agent_prompt
 from band.integrations.claude_sdk.session_manager import (
     ClaudeSessionManager,
     ClaudeSessionManagerStoppedError,
 )
 from band.integrations.mcp import (
+    BandMCPBackend,
     BandMCPBackendSettings,
     BandMCPTransport,
     SharedBandMCPBackend,
@@ -574,6 +579,7 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         history_converter: ClaudeSDKHistoryConverter | None = None,
         additional_tools: list[CustomToolDef] | None = None,
         workspace_for_room: WorkspaceResolver | None = None,
+        resolve_mcp_servers: McpServerResolver | None = None,
         **features: Unpack[FeatureKwargs],
     ) -> None:
         """
@@ -587,6 +593,15 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
             history_converter: Optional custom history converter
             additional_tools: Optional list of custom tools as (PydanticModel, callable)
                 tuples. These are converted to MCP tools internally.
+            resolve_mcp_servers: Optional async callback returning the complete
+                external MCP servers (native ``McpServerConfig`` values by name)
+                for a new Claude connection, given its workspace. Called once per
+                new connection, never on reuse; an empty result means none, and a
+                failure fails the connection without falling back. Band's server
+                is added separately and its name is reserved. The servers reach
+                the CLI through a private file, and the session is used only once
+                every one reports ``connected`` (within 30 seconds). External
+                tools stay under ``permission_mode`` and approvals.
         """
         if not _CLAUDE_SDK_AVAILABLE:
             raise ImportError(
@@ -607,8 +622,13 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
 
         # Created in on_started.
         self._session_manager: ClaudeSessionManager | None = None
+        self._resolve_mcp_servers = resolve_mcp_servers
 
         self._mcp = SharedBandMCPBackend(self._mcp_settings)
+        # The one in-flight whole-adapter teardown every cleanup_all joins, and
+        # a detached Band backend kept until its stop succeeds.
+        self._teardown: asyncio.Task[None] | None = None
+        self._retained_backend: BandMCPBackend | None = None
 
         # Per-room tools: the adapter's own sends use them directly, while the
         # MCP server's tool calls go through _mcp_room_tools (see _bind_mcp_tools).
@@ -673,7 +693,13 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
     async def on_started(self, agent_name: str, agent_description: str) -> None:
         """Create MCP server and session manager after agent metadata is fetched."""
         await super().on_started(agent_name, agent_description)
-        if self._session_manager is not None:
+        if (
+            self._session_manager is not None
+            or self._retained_backend is not None
+            or (self._teardown is not None and not self._teardown.done())
+        ):
+            # Finish (or retry) the previous teardown first: nothing restarts
+            # while it still owns a process, claim or Band server.
             await self.cleanup_all()
 
         await self._mcp.reopen()
@@ -745,6 +771,7 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
             can_use_tool_factory=can_use_tool_factory,
             mcp_servers_factory=self._room_mcp_servers,
             workspaces=self._workspaces,
+            resolve_mcp_servers=self._resolve_mcp_servers,
         )
 
         logger.info(
@@ -839,7 +866,11 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         # The running turn's approvals and MCP calls keep their original tools.
         self._room_tools[room_id] = tools
         await self._bind_mcp_tools(room_id, tools)
+        manager = self._require_admitting(self._session_manager)
         await self._mcp.ensure()
+        # A teardown or restart that began meanwhile owns the manager and the
+        # Band server now; this turn must not start a session against them.
+        self._require_admitting(manager)
 
         # The manager only resumes when it has to create the client: on
         # bootstrap, or after a retired client (see _retire_client).
@@ -849,14 +880,19 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
 
         try:
             client = await self._open_session(
-                manager=self._session_manager,
+                manager=manager,
                 room_id=room_id,
                 resume_session_id=stored_session_id,
             )
         except ClaudeSessionManagerStoppedError:
             raise
-        except Exception:
-            logger.exception("Room %s: Session creation failed", room_id)
+        except Exception as error:
+            if isinstance(error, ClaudeMcpStartupError):
+                # Its message is already safe; a traceback chain could carry
+                # callback or native text.
+                logger.error("Room %s: Session creation failed: %s", room_id, error)
+            else:
+                logger.exception("Room %s: Session creation failed", room_id)
             await tools.send_failure(
                 AgentFailure(_PROVIDER, GENERIC_PROVIDER_FAILURE_MESSAGE)
             )
@@ -955,7 +991,9 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
             return await manager.get_or_create_session(
                 room_id, resume_session_id=resume_session_id
             )
-        except ClaudeSessionManagerStoppedError:
+        except (ClaudeSessionManagerStoppedError, ClaudeMcpStartupError):
+            # Its MCP servers, not the history, failed: resuming without the
+            # history would fail the same way and lose the conversation.
             raise
         except Exception as resume_exc:
             if not resume_session_id:
@@ -1588,7 +1626,29 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         logger.debug("Room %s: Cleaned up Claude SDK session", room_id)
 
     async def cleanup_all(self) -> None:
-        """Cleanup all sessions (call on stop)."""
+        """Cleanup all sessions (call on stop).
+
+        One teardown task does the whole sequence -- turns, sessions, then the
+        Band MCP server -- and every caller joins it, so a cancelled caller
+        can't abandon the rest. If a session's CLI can't be confirmed exited,
+        the Band server it may still dial keeps running and the error is
+        raised; a later call retries. A session startup that asks for this
+        teardown from inside itself returns without waiting for it, since the
+        teardown waits for that startup to settle.
+        """
+        teardown = self._teardown
+        if teardown is None or teardown.done():
+            teardown = asyncio.create_task(self._tear_down(), name="claude-teardown")
+            self._teardown = teardown
+            teardown.add_done_callback(
+                lambda done: done.cancelled() or done.exception()
+            )
+        manager = self._session_manager
+        if manager is not None and manager.is_startup_task(asyncio.current_task()):
+            return
+        await asyncio.shield(teardown)
+
+    async def _tear_down(self) -> None:
         # Decline all pending approvals across rooms
         for room_id in list(self._pending_approvals):
             self._clear_pending_approvals_for_room(room_id)
@@ -1596,7 +1656,13 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
             await self._cancel_turn(room_id)
         if self._session_manager:
             await self._session_manager.stop()
-        await self._mcp.close(final=True)
+        # Custody of the Band server moves here: kept until its stop succeeds,
+        # and no later ensure() can start another one meanwhile.
+        if (backend := await self._mcp.detach(final=True)) is not None:
+            self._retained_backend = backend
+        if self._retained_backend is not None:
+            await self._retained_backend.stop()
+            self._retained_backend = None
         self._room_tools.clear()
         self._mcp_room_tools.clear()
         self._session_context.clear()
@@ -1606,6 +1672,20 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         self._pending_tool_names.clear()
         self._turn_release.clear()
         self._turn_tasks.clear()
+
+    def _require_admitting(
+        self, manager: ClaudeSessionManager | None
+    ) -> ClaudeSessionManager:
+        """``manager``, while it is still the adapter's and no teardown runs."""
+        if manager is None:
+            raise RuntimeError(
+                "ClaudeSDKAdapter session manager not initialized — was on_started() called?"
+            )
+        if manager is not self._session_manager or (
+            self._teardown is not None and not self._teardown.done()
+        ):
+            raise ClaudeSessionManagerStoppedError()
+        return manager
 
     # ------------------------------------------------------------------
     # Chat-based approval flow

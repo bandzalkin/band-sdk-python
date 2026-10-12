@@ -17,6 +17,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import TracebackType
 from typing import Any
 
@@ -119,6 +120,9 @@ class FakeClaude:
         self.errors: list[BaseException] = []
         self.closing: Hold | None = None
         self.refuse_close = False
+        # Scripted mcp_status replies, one per request; the last one repeats.
+        self.mcp_statuses: deque[list[dict[str, Any]]] = deque()
+        self.status_requests = 0
 
     def script(self, *turns: Turn) -> None:
         self._turns.extend(turns)
@@ -167,6 +171,7 @@ class FakeCLISession(Transport):
         self._hooks: dict[str, list[dict[str, Any]]] = {}
         self._served: dict[str, set[str]] = {}
         self._turn: asyncio.Task[None] | None = None
+        self._status_tasks: set[asyncio.Task[None]] = set()
         self.alive = True
         self.refuse_close = False
 
@@ -223,6 +228,11 @@ class FakeCLISession(Transport):
         request = message["request"]
         if request["subtype"] == "initialize":
             self._hooks = request.get("hooks") or {}
+        if request["subtype"] == "mcp_status":
+            self._status_tasks.add(
+                asyncio.create_task(self._answer_status(message["request_id"]))
+            )
+            return
         self._emit(
             type="control_response",
             response={
@@ -443,12 +453,57 @@ class FakeCLISession(Transport):
         content = [block.model_dump(exclude_none=True) for block in result.content]
         return content, result.isError
 
+    @property
+    def configured_servers(self) -> dict[str, Any]:
+        """The MCP servers the CLI was launched with: a dict, or the
+        ``--mcp-config`` file a path names, read as the CLI reads it."""
+        servers = self.options.mcp_servers
+        if isinstance(servers, dict):
+            return servers
+        return json.loads(Path(str(servers)).read_text())["mcpServers"]
+
     def _mcp(self, server: str) -> AbstractAsyncContextManager[ClientSession]:
         """A session to the MCP server the options name, dialed by its URL."""
-        servers = self.options.mcp_servers
-        assert isinstance(servers, dict), servers
-        config = servers[server]
-        return mcp_session(config["url"], BandMCPTransport(config["type"]))
+        config = self.configured_servers[server]
+        return mcp_session(
+            config["url"], BandMCPTransport(config["type"]), config.get("headers")
+        )
+
+    async def _mcp_status(self) -> dict[str, Any]:
+        """What the CLI reports per configured server, including the raw
+        ``config`` (with any credentials) and ``error`` text the real CLI
+        sends. Scripted statuses win; otherwise remote servers count as
+        connected only after a real MCP handshake, and stdio as pending."""
+        self.claude.status_requests += 1
+        if self.claude.mcp_statuses:
+            statuses = self.claude.mcp_statuses
+            entries = statuses.popleft() if len(statuses) > 1 else statuses[0]
+            return {"mcpServers": entries}
+        entries = []
+        for name, config in self.configured_servers.items():
+            entry: dict[str, Any] = {"name": name, "config": config}
+            if config.get("type") in ("http", "sse"):
+                try:
+                    async with asyncio.timeout(5), self._mcp(name):
+                        pass
+                    entry["status"] = "connected"
+                except Exception as error:  # noqa: BLE001 -- any failure is "failed", as the CLI reports
+                    entry["status"] = "failed"
+                    entry["error"] = f"{type(error).__name__}: {config}"
+            else:
+                entry["status"] = "pending"
+            entries.append(entry)
+        return {"mcpServers": entries}
+
+    async def _answer_status(self, request_id: str) -> None:
+        self._emit(
+            type="control_response",
+            response={
+                "subtype": "success",
+                "request_id": request_id,
+                "response": await self._mcp_status(),
+            },
+        )
 
     def _tool_result(self, tool_use_id: str, content: Any, *, is_error: bool) -> None:
         self._emit(

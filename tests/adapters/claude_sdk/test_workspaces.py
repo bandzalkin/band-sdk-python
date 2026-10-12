@@ -106,7 +106,7 @@ async def test_collision_is_rejected_until_owner_leaves(
     assert [session.alive for session in claude.sessions] == [False, True]
 
 
-async def test_cancelled_startup_keeps_claim_and_reuses_client(
+async def test_cancelled_startup_keeps_claim_but_never_serves_its_client(
     claude_room: OpenRoom, claude: FakeClaude, tmp_path: Path
 ) -> None:
     room = await claude_room(workspace_for_room=lambda _: str(tmp_path / "shared"))
@@ -116,12 +116,15 @@ async def test_cancelled_startup_keeps_claim_and_reuses_client(
         opening.cancel()
         with pytest.raises(asyncio.CancelledError):
             await opening
+    claude.connecting = None
     with pytest.raises(ValueError, match="both"):
         await room.beside("room-2").send("hi")
     claude.script([room.model_reply("Connected.")])
     await room.send("again")
-    assert len(claude.sessions) == 1
-    assert claude.sessions[0].alive
+    # The abandoned startup was closed rather than handed to a later turn.
+    assert len(claude.sessions) == 2
+    assert not claude.sessions[0].alive
+    assert claude.sessions[1].alive
     assert room.chat == ["Connected."]
     assert room.failures == []
 

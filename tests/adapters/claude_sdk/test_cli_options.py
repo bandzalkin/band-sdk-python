@@ -38,8 +38,9 @@ def test_owned_transport_preserves_sdk_permission_routing() -> None:
 
     options = ClaudeAgentOptions(cli_path=sys.executable, can_use_tool=allow)
     transport = create_transport(options)
-    assert isinstance(transport, SubprocessCLITransport)
-    command = transport._build_command()
+    inner = transport._inner
+    assert isinstance(inner, SubprocessCLITransport)
+    command = inner._build_command()
     assert command[command.index("--permission-prompt-tool") + 1] == "stdio"
     assert options.permission_prompt_tool_name is None
     assert options.can_use_tool is allow
