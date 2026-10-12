@@ -116,6 +116,70 @@ async def test_failed_start_reaps_the_process_it_spawned() -> None:
     assert not runtime.close_pending
 
 
+def kill_fails_once(process: asyncio.subprocess.Process) -> None:
+    real_kill = process.kill
+    calls = 0
+
+    def kill() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PermissionError("kill refused")
+        real_kill()
+
+    process.kill = kill  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize(
+    "failure", [LookupError("init failed"), asyncio.CancelledError()]
+)
+async def test_failed_start_keeps_its_outcome_when_the_process_will_not_die(
+    failure: BaseException,
+) -> None:
+    spawn = LeakySpawn()
+    runtime = runtime_for(spawn)
+
+    @asynccontextmanager
+    async def failing(client: Any, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        async with spawn(client) as (conn, process):
+            kill_fails_once(process)
+            conn.initialize = AsyncMock(side_effect=failure)
+            yield conn, process
+
+    runtime._spawn_process = failing
+
+    with pytest.raises(type(failure)):
+        await runtime.start()
+
+    process = spawn.processes[0]
+    assert process.returncode is None
+    assert runtime.close_pending
+    assert runtime._conn is None and runtime._ctx is None
+    with pytest.raises(ACPProcessCloseError):
+        await runtime.ensure_connection(can_respawn=True)
+    assert len(spawn.processes) == 1
+
+    await runtime.stop()
+
+    assert process.returncode is not None
+    assert not runtime.close_pending
+
+
+async def test_a_refused_kill_on_stop_is_a_close_error_and_retryable() -> None:
+    spawn = LeakySpawn()
+    runtime = runtime_for(spawn)
+    await runtime.start()
+    kill_fails_once(spawn.processes[0])
+
+    with pytest.raises(ACPProcessCloseError):
+        await runtime.stop()
+    assert runtime.close_pending
+
+    await runtime.stop()
+
+    assert spawn.processes[0].returncode is not None
+
+
 async def test_closed_runtime_never_respawns() -> None:
     spawn = LeakySpawn()
     runtime = runtime_for(spawn)

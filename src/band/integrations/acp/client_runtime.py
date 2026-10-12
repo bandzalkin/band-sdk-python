@@ -263,6 +263,14 @@ class ACPRuntime(ACPSessionOperations):
         ctx: AbstractAsyncContextManager[tuple[ACPConnectionProtocol, object]],
         reason: str,
     ) -> None:
+        # The failed connection and spent context are never reused, whatever
+        # happens below; a process that will not confirm closed stays owned.
+        self._ctx = None
+        self._conn = None
+        self._agent_supports_session_load = False
+        self._agent_supports_session_close = False
+        self._agent_mcp_http = False
+        self._agent_mcp_sse = False
         try:
             await ctx.__aexit__(None, None, None)
         except Exception:
@@ -271,18 +279,12 @@ class ACPRuntime(ACPSessionOperations):
             try:
                 await self._confirm_process_exit()
             except ACPProcessCloseError:
-                # The start's own error is what the caller reports; the
-                # unconfirmed process stays owned (``close_pending``) for a
-                # later stop.
+                # The start's own error or cancellation is what the caller
+                # reports; the unconfirmed process stays owned
+                # (``close_pending``) for a later stop.
                 logger.exception("ACP subprocess not confirmed closed after %s", reason)
             finally:
                 await self._stderr.finish()
-        self._ctx = None
-        self._conn = None
-        self._agent_supports_session_load = False
-        self._agent_supports_session_close = False
-        self._agent_mcp_http = False
-        self._agent_mcp_sse = False
 
     async def _confirm_process_exit(self) -> None:
         """Reap the agent process this runtime spawned, or raise and keep it.
@@ -297,9 +299,9 @@ class ACPRuntime(ACPSessionOperations):
         if process is None:
             return
         if process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
             try:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
                 await process.wait()
             except Exception as error:
                 raise ACPProcessCloseError(
