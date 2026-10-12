@@ -199,6 +199,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         self._owners: dict[str, asyncio.Task[object]] = {}
         self._room_selections: dict[str, ModelSelection] = {}
         self._retirements: dict[str, int] = {}
+        self._retiring: dict[str, asyncio.Task[None]] = {}
         self._resolve_mcp_servers = resolve_mcp_servers
         self._host_schemas = self._build_host_tools()
 
@@ -476,10 +477,14 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
+        if room_id in self._retiring:
+            raise asyncio.CancelledError  # the room is being retired
         retirement = self._retirements.get(room_id, 0)
         async with self._locks.setdefault(room_id, asyncio.Lock()):
-            if self._retirements.get(room_id, 0) != retirement:
-                # The room was retired while this turn waited for it.
+            if room_id in self._retiring or (
+                self._retirements.get(room_id, 0) != retirement
+            ):
+                # The room was retired, or is being retired, while this turn waited.
                 raise asyncio.CancelledError
             owner = asyncio.current_task()
             if owner is not None:
@@ -736,21 +741,55 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
             )
 
     async def on_cleanup(self, room_id: str) -> None:
-        # Turns already queued on the room lock see the new retirement and stand
-        # down instead of resolving, writing an overlay or spawning a process.
+        """Retire a room, joining a retirement already in progress for it.
+
+        Cancelling this call stops only the wait: the shared retirement keeps
+        running, keeps the room closed to new turns, and still owns teardown.
+        """
+        operation = self._retiring.get(room_id)
+        if operation is None:
+            operation = self._begin_retirement(room_id)
+        if self._owners.get(room_id) is asyncio.current_task():
+            # The room's own turn cannot wait for a retirement that waits for it;
+            # teardown follows as soon as that turn ends.
+            return
+        await asyncio.shield(operation)
+
+    def _begin_retirement(self, room_id: str) -> asyncio.Task[None]:
+        # Everything here is synchronous, so admission closes before any turn can
+        # run: queued turns see the new generation, arriving ones the retirement.
         self._retirements[room_id] = self._retirements.get(room_id, 0) + 1
-        owner = self._owners.get(room_id)
-        if owner is not None and owner is not asyncio.current_task():
-            owner.cancel()
-            await asyncio.gather(owner, return_exceptions=True)
+        operation = asyncio.create_task(
+            self._retire(room_id, self._owners.get(room_id), asyncio.current_task())
+        )
+        self._retiring[room_id] = operation
+        operation.add_done_callback(lambda task: self._end_retirement(room_id, task))
+        return operation
+
+    def _end_retirement(self, room_id: str, operation: asyncio.Task[None]) -> None:
+        if self._retiring.get(room_id) is operation:
+            del self._retiring[room_id]
+        if not operation.cancelled() and operation.exception() is not None:
+            logger.warning("OMP room %s retirement did not complete", room_id)
+
+    async def _retire(
+        self,
+        room_id: str,
+        owner: asyncio.Task[object] | None,
+        requester: asyncio.Task[object] | None,
+    ) -> None:
+        if owner is not None:
+            if owner is not requester:
+                owner.cancel()  # once; every later cleanup joins this retirement
+            await asyncio.wait({owner})  # its cancellation handling settles fully
         async with self._locks.setdefault(room_id, asyncio.Lock()):
             await self._close_room(room_id)
         self._room_selections.pop(room_id, None)
 
     async def cleanup_all(self) -> None:
-        # A room still resolving its MCP servers has an owner but no process yet;
-        # cancelling that owner is what keeps it from launching after shutdown.
-        rooms = dict.fromkeys((*self._rooms, *self._owners))
+        # Rooms still resolving have an owner but no process; rooms mid-retirement
+        # may have neither. All of them are retired or joined here.
+        rooms = dict.fromkeys((*self._rooms, *self._owners, *self._retiring))
         await asyncio.gather(*(self.on_cleanup(room_id) for room_id in rooms))
 
 

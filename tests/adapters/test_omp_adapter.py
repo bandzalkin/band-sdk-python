@@ -757,12 +757,13 @@ async def test_cleanup_settles_a_turn_queued_behind_a_blocked_resolution(
     adapter = OmpAdapter(
         OmpAdapterConfig(cwd=str(tmp_path)), resolve_mcp_servers=resolve, emit=()
     )
+    room_lock = SignallingLock()
+    adapter._locks["room-123"] = room_lock
     first = asyncio.create_task(run_turn(adapter, FakeAgentTools()))
     await asyncio.wait_for(entered.wait(), 1)
     blocking = False  # anything that resolves from here on would launch
     queued = asyncio.create_task(run_turn(adapter, FakeAgentTools()))
-    for _ in range(5):
-        await asyncio.sleep(0)  # the second turn now waits on the room lock
+    await asyncio.wait_for(room_lock.contended.wait(), 1)  # queued waits on the lock
 
     await asyncio.wait_for(adapter.cleanup_all(), 1)
 
@@ -837,5 +838,179 @@ async def test_a_turn_after_a_failed_close_never_reuses_the_retiring_process(
 
     assert prompts == 0  # the retiring process got no new work
     assert retiring.close.await_count == 2  # its cleanup was retried first
+    assert len(launches.runtimes) == 2
+    await adapter.cleanup_all()
+
+
+class SignallingLock(asyncio.Lock):
+    """A room lock that reports when a second turn starts waiting for it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.contended = asyncio.Event()
+
+    async def acquire(self) -> bool:
+        if self.locked():
+            self.contended.set()
+        return await super().acquire()
+
+
+class SettlingResolver:
+    """Blocks the first resolution; when cancelled it settles durable work before
+    re-raising, and counts every cancellation it receives along the way."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.entered = asyncio.Event()
+        self.cancel_seen = asyncio.Event()
+        self.settle = asyncio.Event()
+        self.settled = False
+        self.cancellations = 0
+
+    async def __call__(self, _workspace: str):
+        self.calls += 1
+        if self.calls > 1:
+            return {}
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancellations += 1
+            self.cancel_seen.set()
+            try:
+                await self.settle.wait()
+            except asyncio.CancelledError:
+                self.cancellations += 1  # settlement interrupted by a second cancel
+                raise
+            self.settled = True
+            raise
+        return {}
+
+
+def settling_adapter(tmp_path: Path, resolver: SettlingResolver):
+    adapter = OmpAdapter(
+        OmpAdapterConfig(cwd=str(tmp_path)), resolve_mcp_servers=resolver, emit=()
+    )
+    releases: list[bool] = []  # whether settlement had finished at each release
+    real_release = adapter._workspaces.release
+
+    def release(room_id, workspace=None):
+        releases.append(resolver.settled)
+        return real_release(room_id, workspace)
+
+    adapter._workspaces.release = release  # type: ignore[method-assign]
+    return adapter, releases
+
+
+async def start_blocked_turn(adapter, resolver: SettlingResolver):
+    first = asyncio.create_task(run_turn(adapter, FakeAgentTools()))
+    await asyncio.wait_for(resolver.entered.wait(), 1)
+    return first
+
+
+@pytest.mark.asyncio
+async def test_a_turn_arriving_during_retirement_is_refused(
+    launches: Launches, tmp_path: Path
+):
+    resolver = SettlingResolver()
+    adapter, releases = settling_adapter(tmp_path, resolver)
+    first = await start_blocked_turn(adapter, resolver)
+    cleanup = asyncio.create_task(adapter.on_cleanup("room-123"))
+    await asyncio.wait_for(resolver.cancel_seen.wait(), 1)
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(run_turn(adapter, FakeAgentTools()), 1)
+    assert resolver.calls == 1 and launches.runtimes == []
+    assert "room-123" in adapter._workspaces.rooms  # settlement still owns the claim
+
+    resolver.settle.set()
+    await asyncio.wait_for(cleanup, 1)
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert resolver.cancellations == 1 and releases and all(releases)
+    await run_turn(adapter, FakeAgentTools())  # admission reopens after retirement
+    assert resolver.calls == 2 and len(launches.runtimes) == 1
+    await adapter.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_cleanups_cancel_the_settling_turn_once(
+    launches: Launches, tmp_path: Path
+):
+    resolver = SettlingResolver()
+    adapter, releases = settling_adapter(tmp_path, resolver)
+    first = await start_blocked_turn(adapter, resolver)
+    room_cleanup = asyncio.create_task(adapter.on_cleanup("room-123"))
+    await asyncio.wait_for(resolver.cancel_seen.wait(), 1)
+    shutdown = asyncio.create_task(adapter.cleanup_all())
+    # Shutdown must stay joined to the running retirement, not finish or re-cancel.
+    done, _ = await asyncio.wait({shutdown}, timeout=0.1)
+
+    assert not done and resolver.cancellations == 1
+    assert "room-123" in adapter._workspaces.rooms
+    resolver.settle.set()
+    await asyncio.wait_for(asyncio.gather(room_cleanup, shutdown), 1)
+
+    assert resolver.cancellations == 1 and resolver.settled
+    assert releases and all(releases) and not adapter._workspaces.rooms
+    assert launches.runtimes == [] and first.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_cleanup_waiter_leaves_retirement_running(
+    launches: Launches, tmp_path: Path
+):
+    resolver = SettlingResolver()
+    adapter, releases = settling_adapter(tmp_path, resolver)
+    first = await start_blocked_turn(adapter, resolver)
+    waiter = asyncio.create_task(adapter.on_cleanup("room-123"))
+    await asyncio.wait_for(resolver.cancel_seen.wait(), 1)
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert resolver.cancellations == 1
+    assert "room-123" in adapter._workspaces.rooms
+    with pytest.raises(asyncio.CancelledError):  # admission stays closed
+        await asyncio.wait_for(run_turn(adapter, FakeAgentTools()), 1)
+    resolver.settle.set()
+    await asyncio.wait_for(adapter.cleanup_all(), 1)  # joins the same retirement
+    assert resolver.cancellations == 1 and releases and all(releases)
+    assert first.cancelled() and launches.runtimes == []
+
+
+@pytest.mark.asyncio
+async def test_cleanup_all_joins_a_retirement_blocked_in_native_close(
+    launches: Launches, tmp_path: Path
+):
+    adapter = OmpAdapter(OmpAdapterConfig(cwd=str(tmp_path)), emit=())
+    await run_turn(adapter, FakeAgentTools())  # a settled turn leaves a live room
+    (runtime,) = launches.runtimes
+    closing = asyncio.Event()
+    finish_close = asyncio.Event()
+    closes = 0
+
+    async def close():
+        nonlocal closes
+        closes += 1
+        closing.set()
+        await finish_close.wait()
+        runtime.closed = True
+
+    runtime.close = close  # type: ignore[method-assign]
+    room_cleanup = asyncio.create_task(adapter.on_cleanup("room-123"))
+    await asyncio.wait_for(closing.wait(), 1)
+    shutdown = asyncio.create_task(adapter.cleanup_all())
+    with pytest.raises(asyncio.CancelledError):  # no new turn during teardown
+        await asyncio.wait_for(run_turn(adapter, FakeAgentTools()), 1)
+
+    assert not shutdown.done() and "room-123" in adapter._workspaces.rooms
+    finish_close.set()
+    await asyncio.wait_for(asyncio.gather(room_cleanup, shutdown), 1)
+
+    assert closes == 1 and runtime.closed
+    assert len(launches.runtimes) == 1 and not adapter._workspaces.rooms
+    await run_turn(adapter, FakeAgentTools())
     assert len(launches.runtimes) == 2
     await adapter.cleanup_all()

@@ -216,12 +216,17 @@ text/image tool results.
   calls it again; a retired room (cancellation, failure, or cleanup) resolves afresh
   on its next start. The callable is runtime-only and never part of
   `OmpAdapterConfig`.
-- **Room retirement.** Cleanup cancels a room's running turn, including one still
-  resolving, and turns already waiting for that room stand down rather than starting
-  a new process; a resolver that returns after its room was cancelled cannot launch
-  it. A room whose native close fails keeps its process handle, overlay and
-  exclusive workspace claim until a later close succeeds: `on_cleanup` raises the
-  failure, `cleanup_all` and the room's next turn retry the close, and the retiring
+- **Room retirement.** `on_cleanup` starts one retirement per room, and overlapping
+  `on_cleanup` and `cleanup_all` calls join it. That retirement cancels the room's
+  running turn once, including one still resolving, waits until the turn has
+  finished handling its cancellation, and only then closes the process and releases
+  the workspace. Cancelling a cleanup call stops only that caller's wait. Until the
+  retirement ends, turns already waiting for the room and turns that arrive during
+  it are cancelled rather than starting a new process; a resolver that returns
+  after its room was cancelled cannot launch it. A later turn starts normally. A
+  room whose native close fails keeps its process handle, overlay and exclusive
+  workspace claim until a later close succeeds: `on_cleanup` raises the failure,
+  `cleanup_all` and the room's next turn retry the close first, and the retiring
   process never receives new work.
 - **Permissions.** `approval_mode="yolo"` bypasses native approval checks without
   changing Band platform permissions. Otherwise `resolve_permission` receives
