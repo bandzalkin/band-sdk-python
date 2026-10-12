@@ -113,11 +113,16 @@ migrate before upgrading. TypeScript parity is a separate change.
 - A room keeps its runtime and workspace claim until its agent process is confirmed
   exited: a rejoining room waits for the old process, and one that cannot be reaped is
   kept (the cleanup raises) and retried by the room's next turn or cleanup. A setup a
-  cleanup or a leaving turn cancelled also holds the room until it settles.
-- `cleanup_all` admits no room while it runs. After the final one (`Agent.stop()`) turns
-  fail with `ACPAdapterShutDownError` until `on_started`; after `stop()` they proceed once
-  it settles. If an agent process cannot be confirmed closed, the Band MCP server is kept
-  for it and a later `cleanup_all` retries both.
+  cleanup or a leaving turn gave up on also holds the room until it settles, and is
+  cancelled at most once: a setup already being cancelled is waited for, not cancelled
+  again.
+- `cleanup_all` is one shared operation: concurrent calls join it, and cancelling a
+  caller stops neither the teardown nor its hold on new rooms, which are admitted only
+  after it settles. Any final call (`Agent.stop()`) makes the whole operation final:
+  turns, including ones already waiting, fail with `ACPAdapterShutDownError` until
+  `on_started`, which itself waits for the teardown to finish. If an agent process
+  cannot be confirmed closed, the Band MCP server is kept for it and a later
+  `cleanup_all` retries both.
 
 ## Per-room MCP servers
 

@@ -14,7 +14,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import partial
 from typing import Any, ClassVar, Generic, TypeAlias
@@ -144,13 +144,34 @@ class ACPPermissionRequest:
 
 @dataclass
 class SessionInitializer:
-    """One room's shared, not-yet-published session setup. ``cancelled``
-    records that its cancellation was requested, so it is requested once and
-    the setup never reaches the agent or publishes afterwards."""
+    """One room's shared, not-yet-published session setup.
+
+    ``invalidated`` marks it unusable (abandoned or retiring): it never reaches
+    the agent or publishes afterwards. ``cancel_requested`` records that its
+    cancellation is already under way, by this adapter or the task itself, so
+    no later owner injects another into its settlement.
+    """
 
     task: asyncio.Task[tuple[str, bool]]
     waiters: int = 0
-    cancelled: bool = False
+    invalidated: bool = False
+    cancel_requested: bool = False
+
+    def invalidate(self) -> None:
+        """Mark the setup unusable and see it cancelled exactly once.
+
+        A setup retiring itself, or one whose task already has a cancellation
+        outstanding, is not cancelled again: its settlement is joined, never
+        interrupted.
+        """
+        self.invalidated = True
+        task = self.task
+        if self.cancel_requested or task.done():
+            return
+        self.cancel_requested = True
+        if task is asyncio.current_task() or task.cancelling():
+            return
+        task.cancel()
 
 
 @dataclass(frozen=True)
@@ -159,6 +180,15 @@ class RoomRetirement:
 
     task: asyncio.Task[None]
     setup: asyncio.Task[tuple[str, bool]] | None
+
+
+@dataclass
+class AdapterShutdown:
+    """The adapter's one shared, in-flight ``cleanup_all``. Callers join it;
+    ``final`` only ever upgrades."""
+
+    final: bool
+    task: asyncio.Task[None] = field(init=False)
 
 
 _PROVIDER = "acp"
@@ -480,11 +510,10 @@ class ACPClientAdapter(
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._mcp = SharedBandMCPBackend(self._mcp_settings)
         self._session_lock = asyncio.Lock()
-        # Room admission: closed while an adapter-wide cleanup runs, and after
-        # a final one until on_started.
-        self._admission_open = asyncio.Event()
-        self._admission_open.set()
-        self._cleanups = 0
+        # The adapter's in-flight cleanup_all, which closes room admission
+        # while it runs; after a final one admission stays closed until
+        # on_started.
+        self._shutdown: AdapterShutdown | None = None
         self._shut_down = False
 
     @property
@@ -666,7 +695,7 @@ class ACPClientAdapter(
 
     async def _runtime_for(self, room_id: str) -> ACPRuntime:
         """The room's runtime, built on first use. Waits out a retirement in
-        flight or an adapter-wide cleanup (refusing after a final one until
+        flight or the adapter's shutdown (refusing after a final one until
         ``on_started``), and first finishes retiring a runtime left closed or
         with an agent process an earlier stop could not confirm closed (raising
         if it still cannot)."""
@@ -676,11 +705,11 @@ class ACPClientAdapter(
                     raise ACPAdapterShutDownError(
                         "the ACP adapter is shut down until on_started runs again"
                     )
-                admitted = self._admission_open.is_set()
+                shutdown = self._shutdown
                 retirement = self._retirements.get(room_id)
                 runtime = self._runtimes.get(room_id)
                 if (
-                    admitted
+                    shutdown is None
                     and retirement is None
                     and (
                         runtime is None or not (runtime.closed or runtime.close_pending)
@@ -691,8 +720,9 @@ class ACPClientAdapter(
                         runtime = self._build_runtime(workspace)
                         self._runtimes[room_id] = runtime
                     return runtime
-            if not admitted:
-                await self._admission_open.wait()
+            if shutdown is not None:
+                # Recheck once it settles: a final shutdown refuses the turn.
+                await asyncio.wait((shutdown.task,))
             elif retirement is not None:
                 await asyncio.wait((retirement.task,))
             else:
@@ -721,11 +751,17 @@ class ACPClientAdapter(
 
     async def on_started(self, agent_name: str, agent_description: str) -> None:
         await super().on_started(agent_name, agent_description)
-        # Agent.start() reuses this instance after cleanup_all(final=True).
-        await self._mcp.reopen()
-        self._shut_down = False
-        if not self._cleanups:
-            self._admission_open.set()
+        # Agent.start() reuses this instance after cleanup_all(final=True). An
+        # in-flight shutdown settles first: it would otherwise stop the Band
+        # server under, or retire, what this start admits.
+        while True:
+            if (shutdown := self._shutdown) is not None:
+                await asyncio.wait((shutdown.task,))
+                continue
+            await self._mcp.reopen()
+            if self._shutdown is None:
+                self._shut_down = False
+                return
 
     async def on_message(
         self,
@@ -1171,7 +1207,7 @@ class ACPClientAdapter(
                 if stale is not None and stale.band_url == mcp.band_url:
                     return stale.session_id, False
                 settling = self._session_initializers.get(room_id)
-                if settling is None or not settling.cancelled or settling.task.done():
+                if settling is None or not settling.invalidated or settling.task.done():
                     if stale is not None:
                         del self._room_to_session[room_id]
                         # Never restore: the persisted id may be the one being retired.
@@ -1233,7 +1269,7 @@ class ACPClientAdapter(
             return False
         return (
             published_session_retired
-            or initializer.cancelled
+            or initializer.invalidated
             or task.cancelled()
             or task.exception() is not None
         )
@@ -1260,7 +1296,7 @@ class ACPClientAdapter(
             if initializer.task.done():
                 self._session_initializers.pop(room_id)
                 return
-            self._request_initializer_cancel(initializer)
+            initializer.invalidate()
             initializer.task.add_done_callback(
                 lambda _: self._forget_settled_initializer(room_id, initializer)
             )
@@ -1399,7 +1435,7 @@ class ACPClientAdapter(
             initializer is None
             or task is None
             or initializer.task is not task
-            or initializer.cancelled
+            or initializer.invalidated
             or task.cancelling()
             or room_id in self._retirements
         ):
@@ -1775,6 +1811,8 @@ class ACPClientAdapter(
         self._on_room_retiring(room_id)
         session = self._room_to_session.pop(room_id, None)
         initializer = self._session_initializers.pop(room_id, None)
+        if initializer is not None:
+            initializer.invalidate()
         self._room_tools.pop(room_id, None)
         retirement = RoomRetirement(
             task=asyncio.create_task(
@@ -1797,7 +1835,9 @@ class ACPClientAdapter(
     ) -> None:
         try:
             if initializer is not None:
-                await self._cancel_session_initializer(initializer)
+                # Invalidated (and cancelled once, if needed) when the room was
+                # fenced; joined here, never cancelled again.
+                await asyncio.wait((initializer.task,))
             runtime = self._runtimes.get(room_id)
             if runtime is not None:
                 await runtime.close()
@@ -1826,12 +1866,15 @@ class ACPClientAdapter(
         server. Idempotent — safe to call again from ``stop()``, which also
         retries any agent process an earlier pass could not confirm closed.
 
-        Room admission closes before the first await, so no room starts outside
-        the teardown's snapshot. A final teardown keeps it closed until
-        ``on_started``; a restartable one reopens it once the teardown settles.
-        If any agent process cannot be confirmed closed, the other rooms are
-        still released but the Band MCP server that process may still dial is
-        kept, and the first failure is raised; a later call retries both.
+        The teardown is one shared operation that every concurrent caller
+        joins, shielded: a cancelled caller ends neither it nor its admission
+        fence. Room admission closes before the first await, so no room starts
+        outside its snapshot; turns parked on it recheck once it settles. Any
+        final request upgrades the operation, and a final teardown refuses
+        turns until ``on_started``; after a restartable one they proceed. If an
+        agent process cannot be confirmed closed, the other rooms are still
+        released but the Band MCP server that process may still dial is kept,
+        and the first failure is raised; a later call retries both.
 
         ``final`` distinguishes real process shutdown (the default: no future turn
         can arrive, so a still-parked one must fail rather than start resources
@@ -1841,55 +1884,58 @@ class ACPClientAdapter(
         connection (``_ensure_connection``'s ``can_respawn``) and the MCP backend,
         so ``final=False`` must leave that path open.
         """
-        self._admission_open.clear()
-        self._cleanups += 1
+        shutdown = self._shutdown
+        if shutdown is None:
+            shutdown = AdapterShutdown(final=final)
+            shutdown.task = asyncio.create_task(
+                self._run_shutdown(shutdown), name="acp-shutdown"
+            )
+            self._shutdown = shutdown
+            shutdown.task.add_done_callback(
+                lambda task: self._end_shutdown(shutdown, task)
+            )
+        elif final:
+            shutdown.final = True
         if final:
             self._shut_down = True
-        try:
-            async with self._session_lock:
-                rooms = {
-                    *self._runtimes,
-                    *self._session_initializers,
-                    *self._retirements,
-                    *self._room_to_session,
-                    *self._room_tools,
-                    *self._workspaces.rooms,
-                }
-            results = await asyncio.gather(
-                *(self._retire_room(room_id) for room_id in rooms),
-                return_exceptions=True,
-            )
-            await self._drain_background_tasks()
-            failures = [
-                result for result in results if isinstance(result, BaseException)
-            ]
-            if failures:
-                raise failures[0]
-            await self._mcp.close(final=final)
-        finally:
-            self._cleanups -= 1
-            if not self._cleanups and not self._shut_down:
-                self._admission_open.set()
+        await asyncio.shield(shutdown.task)
         logger.info("ACP client adapter stopped")
+
+    async def _run_shutdown(self, shutdown: AdapterShutdown) -> None:
+        async with self._session_lock:
+            rooms = {
+                *self._runtimes,
+                *self._session_initializers,
+                *self._retirements,
+                *self._room_to_session,
+                *self._room_tools,
+                *self._workspaces.rooms,
+            }
+        results = await asyncio.gather(
+            *(self._retire_room(room_id) for room_id in rooms),
+            return_exceptions=True,
+        )
+        await self._drain_background_tasks()
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise failures[0]
+        closed_final = shutdown.final
+        await self._mcp.close(final=closed_final)
+        if shutdown.final and not closed_final:
+            # Upgraded to final while the backend stopped.
+            await self._mcp.close(final=True)
+
+    def _end_shutdown(
+        self, shutdown: AdapterShutdown, task: asyncio.Task[None]
+    ) -> None:
+        if self._shutdown is shutdown:
+            self._shutdown = None
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning("ACP adapter cleanup failed")
 
     async def stop(self) -> None:
         """Tear down now (used by the ``on_message`` error path); see ``cleanup_all``."""
         await self.cleanup_all(final=False)
-
-    @staticmethod
-    def _request_initializer_cancel(initializer: SessionInitializer) -> None:
-        """Cancel in-flight setup at most once; later requests join it."""
-        if not initializer.cancelled:
-            initializer.cancelled = True
-            initializer.task.cancel()
-
-    @classmethod
-    async def _cancel_session_initializer(cls, initializer: SessionInitializer) -> None:
-        """Cancel in-flight setup once and wait for it to settle. A later caller
-        joins the settlement rather than cancelling again, and unlike ``gather``
-        a cancelled waiter neither re-cancels nor abandons it."""
-        cls._request_initializer_cancel(initializer)
-        await asyncio.wait((initializer.task,))
 
     async def _fetch_replay(
         self,
