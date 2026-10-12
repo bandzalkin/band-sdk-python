@@ -40,10 +40,12 @@ async def test_a_cancelled_teardown_caller_does_not_abandon_the_band_server(
     hold, stops = hold_stop(room)
 
     caller = asyncio.create_task(room.adapter.cleanup_all())
-    await hold.reached.wait()
-    caller.cancel()
-    await asyncio.gather(caller, return_exceptions=True)
-    hold.released.set()
+    try:
+        await hold.reached.wait()
+        caller.cancel()
+        await asyncio.gather(caller, return_exceptions=True)
+    finally:
+        hold.released.set()
     await room.adapter.cleanup_all()
 
     assert stops == ["stopped"]

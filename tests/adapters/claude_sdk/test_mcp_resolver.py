@@ -18,9 +18,12 @@ from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
 from band.integrations.claude_sdk.mcp_startup import ClaudeMcpStartupError
+from band.integrations.claude_sdk.session_manager import (
+    ClaudeSessionManagerStoppedError,
+)
 from band.runtime.tools import BAND_MCP_SERVER_NAME
 from tests.adapters.claude_sdk.external_mcp import external_mcp
-from tests.adapters.claude_sdk.fakecli import FakeClaude, FakeCLISession
+from tests.adapters.claude_sdk.fakecli import FakeClaude, FakeCLISession, Hold
 from tests.adapters.claude_sdk.helpers import ClaudeRoom
 from tests.baseline.decisions import ModelDecision
 
@@ -332,3 +335,231 @@ async def test_the_native_launch_carries_a_private_file_path_not_credentials(
     await room.leave()
     assert not path.exists()
     assert not path.parent.exists()
+
+
+async def test_a_missing_history_still_falls_back_to_a_fresh_session(
+    claude_room: OpenRoom, claude: FakeClaude
+) -> None:
+    claude.unresumable = {"sess-gone"}
+    resolver = Resolver({})
+    room = await claude_room(resolve_mcp_servers=resolver)
+    claude.script([room.model_reply("Fresh.")])
+    await room.send("hi", session_id="sess-gone")
+
+    assert claude.resumed == ["sess-gone", None]
+    # Each genuine connection resolved its own snapshot.
+    assert len(resolver.calls) == 2
+    assert room.chat == ["Fresh."]
+
+
+class ExplodingServers(Mapping[str, Any]):
+    """A mapping that fails while being read, with a credential in its error."""
+
+    def __getitem__(self, key: str) -> Any:
+        raise LookupError(f"vault said {GRANT_A}")
+
+    def __iter__(self) -> Any:
+        raise LookupError(f"vault said {GRANT_A}")
+
+    def __len__(self) -> int:
+        return 1
+
+
+@pytest.mark.parametrize("failure", ["unreadable-result", "typed-error"])
+async def test_callback_failures_are_sanitized_and_never_retried_fresh(
+    claude_room: OpenRoom,
+    claude: FakeClaude,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+) -> None:
+    calls: list[str] = []
+
+    async def resolver(workspace: str) -> Mapping[str, Any]:
+        calls.append(workspace)
+        if failure == "typed-error":
+            raise ClaudeMcpStartupError(
+                "resolution", f"token {GRANT_A}", server=GRANT_A
+            )
+        return ExplodingServers()
+
+    room = await claude_room(resolve_mcp_servers=resolver)
+    with caplog.at_level(logging.DEBUG), pytest.raises(ClaudeMcpStartupError) as caught:
+        await room.send("hi", session_id="sess-earlier")
+
+    assert len(calls) == 1
+    assert claude.sessions == []
+    assert_secret_free(GRANT_A, caught.value, caplog.text)
+
+
+async def test_no_prompt_before_a_held_status_reports_connected(
+    claude_room: OpenRoom, claude: FakeClaude
+) -> None:
+    hold = claude.status_hold = Hold()
+    room = await claude_room(resolve_mcp_servers=Resolver({}))
+    claude.script([room.model_reply("Ready.")])
+    sending = room.send_in_background("hi")
+    try:
+        await hold.reached.wait()
+        assert claude.prompts == []
+        assert not room.adapter._session_manager.has_session(room.room_id)
+    finally:
+        hold.released.set()
+    await sending
+    assert room.chat == ["Ready."]
+
+
+@pytest.mark.looptime
+async def test_a_status_request_that_never_answers_fails_at_the_readiness_deadline(
+    claude_room: OpenRoom, claude: FakeClaude
+) -> None:
+    hold = claude.status_hold = Hold()
+    room = await claude_room(resolve_mcp_servers=Resolver({}))
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        with pytest.raises(ClaudeMcpStartupError, match="deadline"):
+            await room.send("hi")
+        # Bounded by the 30 s total, not the SDK's own 60 s per request.
+        assert 30 <= loop.time() - started < 31
+        assert claude.prompts == []
+    finally:
+        hold.released.set()
+
+
+async def test_a_cli_without_mcp_status_fails_safely(
+    claude_room: OpenRoom, claude: FakeClaude
+) -> None:
+    claude.status_unsupported = True
+    room = await claude_room(resolve_mcp_servers=Resolver({}))
+    with pytest.raises(ClaudeMcpStartupError, match="status request failed"):
+        await room.send("hi")
+    assert claude.prompts == []
+    assert not claude.sessions[0].alive
+
+
+@pytest.mark.parametrize("held", ["resolution", "readiness"])
+async def test_a_band_server_replaced_during_startup_gets_a_new_connection(
+    claude_room: OpenRoom, claude: FakeClaude, held: str
+) -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls: list[str] = []
+
+    async def resolver(workspace: str) -> Mapping[str, Any]:
+        calls.append(workspace)
+        if held == "resolution" and len(calls) == 1:
+            entered.set()
+            await release.wait()
+        return {}
+
+    if held == "readiness":
+        hold = claude.status_hold = Hold()
+    room = await claude_room(resolve_mcp_servers=resolver)
+    claude.script([room.model_reply("Live.")])
+    sending = room.send_in_background("hi")
+    try:
+        if held == "resolution":
+            await entered.wait()
+        else:
+            await hold.reached.wait()
+        old_url = room.adapter._room_mcp_servers(room.room_id)[BAND_MCP_SERVER_NAME][
+            "url"
+        ]
+        await room.crash_band_server()
+        await room.adapter._mcp.ensure()
+    finally:
+        release.set()
+        if held == "readiness":
+            claude.status_hold = None
+            hold.released.set()
+    await sending
+
+    live = claude.sessions[-1]
+    assert live.alive
+    assert live.configured_servers[BAND_MCP_SERVER_NAME]["url"] != old_url
+    assert all(not s.alive for s in claude.sessions[:-1])
+    assert len(calls) == 2
+    assert room.chat == ["Live."]
+
+
+async def test_a_relative_stdio_command_stays_anchored_to_the_workspace(
+    claude_room: OpenRoom, claude: FakeClaude, tmp_path: Path
+) -> None:
+    claude.mcp_statuses.append(connected("tool", BAND_MCP_SERVER_NAME))
+    resolver = Resolver(
+        {"tool": {"type": "stdio", "command": "./bin/tool", "args": ["-v"]}}
+    )
+    room = await claude_room(
+        workspace_for_room=lambda room_id: str(tmp_path / room_id),
+        resolve_mcp_servers=resolver,
+    )
+    claude.script([room.model_reply("Hi.")])
+    await room.send("hi")
+
+    [session] = claude.sessions
+    assert session.configured_servers["tool"] == {
+        "type": "stdio",
+        "command": "./bin/tool",
+        "args": ["-v"],
+    }
+    assert str(session.options.cwd) == str(tmp_path / "room-1")
+
+
+async def test_a_resolver_requesting_teardown_behind_a_settling_turn_publishes_nothing(
+    claude_room: OpenRoom, claude: FakeClaude
+) -> None:
+    adapter_ref: list[Any] = []
+    requested = asyncio.Event()
+
+    async def resolver(workspace: str) -> Mapping[str, Any]:
+        if workspace.endswith("room-1"):
+            return {}
+        await adapter_ref[0].cleanup_all()
+        requested.set()
+        return {}
+
+    room = await claude_room(resolve_mcp_servers=resolver)
+    adapter_ref.append(room.adapter)
+    other = room.beside("room-2")
+    turn_hold = Hold()
+    claude.script([turn_hold])
+    first = room.send_in_background("hold on")
+    await turn_hold.reached.wait()
+    sessions_before = len(claude.sessions)
+
+    with pytest.raises((ClaudeMcpStartupError, ClaudeSessionManagerStoppedError)):
+        await other.send("hi")
+    assert requested.is_set()
+    turn_hold.released.set()
+    await asyncio.gather(first, return_exceptions=True)
+    await room.adapter.cleanup_all()
+
+    # The room-2 startup asked for the teardown and was refused on its own:
+    # nothing launched after the request.
+    assert len(claude.sessions) == sessions_before
+    assert not room.adapter._session_manager.owns_resources()
+
+
+async def test_a_failed_teardown_keeps_turns_out_until_a_restart(
+    claude_room: OpenRoom, claude: FakeClaude
+) -> None:
+    room = await claude_room(resolve_mcp_servers=Resolver({}))
+    claude.script([room.model_reply("Hi.")])
+    await room.send("hi")
+    backend = room.adapter._mcp.current
+    bound = room.adapter._mcp_room_tools.get(room.room_id)
+    claude.refuse_close = True
+    try:
+        with pytest.raises(BaseException, match="cleanup"):
+            await room.adapter.cleanup_all()
+        # The retained Band server dies; a late turn must not start another.
+        await room.crash_band_server()
+        with pytest.raises(ClaudeSessionManagerStoppedError):
+            await room.send("again")
+        assert room.adapter._mcp.current is backend
+        assert room.adapter._mcp_room_tools.get(room.room_id) is bound
+    finally:
+        claude.refuse_close = False
+    await room.adapter.on_started("Test Agent", "restarted")
+    claude.script([room.model_reply("Back.")])
+    await room.send("later")
+    assert room.chat == ["Hi.", "Back."]

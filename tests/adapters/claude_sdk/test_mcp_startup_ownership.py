@@ -5,6 +5,7 @@ the real SDK client."""
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -19,9 +20,10 @@ from band.integrations.claude_sdk.session_manager import (
 )
 from band.runtime.tools import BAND_MCP_SERVER_NAME
 from band.workspaces import RoomWorkspaces
-from tests.adapters.claude_sdk.fakecli import FakeClaude
+from tests.adapters.claude_sdk.fakecli import FakeClaude, Hold
 
 BAND = {BAND_MCP_SERVER_NAME: {"type": "http", "url": "http://127.0.0.1:9/band"}}
+SECRET = "close-5ecret"
 
 
 class HeldResolver:
@@ -54,12 +56,18 @@ class HeldResolver:
 
 
 def manager_for(
-    tmp_path: Path, resolver: Any, claude: FakeClaude
+    tmp_path: Path,
+    resolver: Any,
+    claude: FakeClaude,
+    band: dict[str, Any] | None = None,
 ) -> ClaudeSessionManager:
+    """A manager whose protected Band server is ``band`` (changed in place to
+    model a replaced Band server)."""
+    protected = BAND if band is None else band
     claude.mcp_statuses.append([{"name": BAND_MCP_SERVER_NAME, "status": "connected"}])
     return ClaudeSessionManager(
         ClaudeAgentOptions(),
-        mcp_servers_factory=lambda room_id: BAND,
+        mcp_servers_factory=lambda room_id: dict(protected),
         workspaces=RoomWorkspaces(lambda room_id: str(tmp_path / room_id)),
         resolve_mcp_servers=resolver,
     )
@@ -262,7 +270,7 @@ async def test_a_failed_close_keeps_the_file_and_claim_until_a_retry(
         [session] = claude.sessions
         path = Path(str(session.options.mcp_servers))
         claude.refuse_close = True
-        with pytest.raises(RuntimeError, match="cleanup failed"):
+        with pytest.raises(ClaudeMcpStartupError, match="cleanup"):
             await manager.cleanup_session("room-a")
         assert path.exists()
         assert manager.owns_resources()
@@ -333,4 +341,164 @@ async def test_a_settling_startup_is_never_cancelled_again(
         assert not manager.owns_resources()
     finally:
         resolver.release.set()
+        await manager.stop()
+
+
+class CountingResolver:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def __call__(self, workspace: str) -> Mapping[str, Any]:
+        self.calls.append(workspace)
+        return {}
+
+
+async def outdated_session(
+    tmp_path: Path, claude: FakeClaude
+) -> tuple[ClaudeSessionManager, CountingResolver, dict[str, Any]]:
+    """A manager whose room-a session (A) dials a Band server since replaced."""
+    resolver = CountingResolver()
+    band = dict(BAND)
+    manager = manager_for(tmp_path, resolver, claude, band)
+    await manager.get_or_create_session("room-a")
+    band[BAND_MCP_SERVER_NAME] = {"type": "http", "url": "http://127.0.0.1:9/band-2"}
+    return manager, resolver, band
+
+
+async def test_a_replacement_whose_caller_left_during_the_old_close_never_publishes(
+    tmp_path: Path, claude: FakeClaude
+) -> None:
+    manager, resolver, _ = await outdated_session(tmp_path, claude)
+    hold = claude.closing = Hold()
+    try:
+        replacing = asyncio.create_task(manager.get_or_create_session("room-a"))
+        await hold.reached.wait()  # the old client's close is in progress
+        replacing.cancel()
+        await asyncio.gather(replacing, return_exceptions=True)
+        hold.released.set()
+        await manager.cleanup_session("room-a")
+
+        # The replacement was retired: never resolved, launched or published.
+        assert len(resolver.calls) == 1
+        assert len(claude.sessions) == 1
+        assert not claude.sessions[0].alive
+        assert not manager.owns_resources()
+    finally:
+        hold.released.set()
+        claude.closing = None
+        await manager.stop()
+
+
+async def test_stop_during_a_replacements_old_close_leaves_nothing_behind(
+    tmp_path: Path, claude: FakeClaude
+) -> None:
+    manager, resolver, _ = await outdated_session(tmp_path, claude)
+    hold = claude.closing = Hold()
+    try:
+        replacing = asyncio.create_task(manager.get_or_create_session("room-a"))
+        await hold.reached.wait()
+        stopping = asyncio.create_task(manager.stop())
+        hold.released.set()
+        await stopping
+        with pytest.raises(ClaudeSessionManagerStoppedError):
+            await replacing
+        await manager.stop()
+
+        assert len(resolver.calls) == 1
+        assert len(claude.sessions) == 1
+        assert not manager.owns_resources()
+    finally:
+        hold.released.set()
+        claude.closing = None
+
+
+async def test_a_resolver_that_swallows_its_own_cancellation_publishes_nothing(
+    tmp_path: Path, claude: FakeClaude
+) -> None:
+    async def resolver(workspace: str) -> Mapping[str, Any]:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            pass  # caught, never uncancelled, and a result returned anyway
+        return {}
+
+    manager = manager_for(tmp_path, resolver, claude)
+    try:
+        with pytest.raises(ClaudeMcpStartupError):
+            await manager.get_or_create_session("room-a")
+        assert claude.sessions == []
+        assert not manager.has_session("room-a")
+    finally:
+        await manager.stop()
+
+
+async def test_a_finished_keep_claim_retirement_does_not_stall_a_releasing_cleanup(
+    tmp_path: Path, claude: FakeClaude
+) -> None:
+    manager = manager_for(tmp_path, CountingResolver(), claude)
+    await manager.get_or_create_session("room-a")
+    try:
+        # A membership-keeping retirement that finished, its removal callback
+        # not yet run.
+        keeping = manager._begin_room_retirement("room-a", release_workspace=False)
+        await asyncio.shield(keeping.task)
+        manager._retirements["room-a"] = keeping
+
+        await manager.cleanup_session("room-a")
+
+        assert not manager.owns_resources()
+    finally:
+        await manager.stop()
+
+
+async def test_a_file_that_cannot_be_removed_stays_owned_until_a_retry(
+    tmp_path: Path, claude: FakeClaude
+) -> None:
+    manager = manager_for(tmp_path, CountingResolver(), claude)
+    await manager.get_or_create_session("room-a")
+    path = Path(str(claude.sessions[0].options.mcp_servers))
+    path.parent.chmod(0o500)
+    try:
+        with pytest.raises(ClaudeMcpStartupError, match="cleanup"):
+            await manager.cleanup_session("room-a")
+        assert path.exists()
+        assert manager.owns_resources()
+
+        path.parent.chmod(0o700)
+        await manager.cleanup_session("room-a")
+        assert not path.exists()
+        assert not manager.owns_resources()
+    finally:
+        if path.parent.exists():
+            path.parent.chmod(0o700)
+        await manager.stop()
+
+
+async def test_a_close_failure_reports_no_native_text(
+    tmp_path: Path, claude: FakeClaude, caplog: pytest.LogCaptureFixture
+) -> None:
+    manager = manager_for(tmp_path, CountingResolver(), claude)
+    await manager.get_or_create_session("room-a")
+    [session] = claude.sessions
+    real_close = session.close
+
+    async def leaking_close() -> None:
+        raise OSError(f"close failed with {SECRET}")
+
+    session.close = leaking_close  # type: ignore[method-assign]
+    try:
+        with (
+            caplog.at_level(logging.DEBUG),
+            pytest.raises(ClaudeMcpStartupError) as caught,
+        ):
+            await manager.cleanup_session("room-a")
+        rendered = [str(caught.value), repr(caught.value), caplog.text]
+        assert caught.value.__cause__ is None and caught.value.__suppress_context__
+        assert not any(SECRET in text for text in rendered)
+        assert manager.owns_resources()
+    finally:
+        session.close = real_close  # type: ignore[method-assign]
         await manager.stop()

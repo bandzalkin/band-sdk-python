@@ -84,29 +84,36 @@ reuse the failed client or take another room's claimed directory.
   configs) for a new Claude connection in that room's workspace.
   - It runs once per new connection, outside the session queue; reusing a
     room's connection never calls it, so a rotated grant reaches only a later
-    connection. An empty result means no external servers; a failure fails the
-    turn with `ClaudeMcpStartupError` and never falls back or resumes without
-    the room's history.
+    connection. An empty result means no external servers. A failure to
+    resolve, read or validate the servers, or to see them connect, fails the
+    turn with `ClaudeMcpStartupError` and never resumes without the room's
+    history; only the CLI itself failing to start (a session that can't be
+    resumed, for one) is retried as a fresh session, which resolves again.
   - Band's server is added separately; the name `band` and in-process `sdk`
     servers are refused by name. The servers reach the CLI only as the path of a
     private file (directory `0700`, file `0600`), never on its command line, and
-    the file stays until the CLI's exit is confirmed.
+    the file stays until the CLI's exit is confirmed and the file is removed.
   - The session is used only after every server, Band's included, reports
     `connected` through the CLI's `mcp_status`; anything else within 30 seconds
-    fails the turn. Errors and logs name the stage, server and exception type,
-    never callback values, credentials or native error text.
+    (each status request included) fails the turn. Errors and logs name the
+    stage, server and exception type, never callback values, credentials or
+    native error text -- even for a `ClaudeMcpStartupError` the callback raised.
   - External tools stay under `permission_mode` and `approvals`; they are never
     added to the tool allowlist.
 - **A starting connection is owned until it settles.** Callers for a room share
-  one startup. If the last one stops waiting, or the room is cleaned up, the
-  startup is retired: it publishes nothing, is cancelled at most once, and keeps
-  its process, file and workspace claim until it settles. A callback may itself
-  clean up its room or the adapter; that request returns without waiting on the
-  startup it came from.
-- **Teardown keeps what it can't release.** A CLI whose exit can't be confirmed
-  is kept, with its file, claim and the Band server it may dial, and
-  `cleanup_all()` raises; calling it again (or `on_started`) retries. Concurrent
-  `cleanup_all()` calls share one teardown that a cancelled caller can't abandon.
+  one startup, which also owns the outdated client it replaces. If the last
+  caller stops waiting, the startup's own task is cancelled (even if the
+  callback swallows it), or the room is cleaned up, the startup is retired: it
+  publishes nothing, is cancelled at most once, and keeps its process, file and
+  workspace claim until it settles. A callback may itself clean up its room or
+  the adapter; that request returns without waiting on the startup it came from.
+- **Teardown keeps what it can't release.** `cleanup_all()` refuses new turns
+  and session startups as soon as it is called, and keeps refusing them until a
+  successful `on_started`. A CLI whose exit can't be confirmed within 5 seconds of
+  being killed, or a private file that can't be removed, is kept with its
+  workspace claim and the Band server it may dial, and the cleanup raises a safe
+  error; calling it again (or `on_started`) retries. Concurrent `cleanup_all()`
+  calls share one teardown that a cancelled caller can't abandon.
 
 ```python
 import pytest

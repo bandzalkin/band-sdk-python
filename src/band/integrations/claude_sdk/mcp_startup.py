@@ -3,7 +3,9 @@ connection, written to a private file, and positive per-server readiness.
 
 Nothing here renders callback values, native status payloads or native error
 text: they can carry credentials. Errors name the stage, a known server name,
-a fixed reason and the exception type only.
+a fixed reason and the exception type only, and only errors created here are
+trusted to say so -- one raised by a callback, even a ``ClaudeMcpStartupError``,
+is replaced.
 """
 
 from __future__ import annotations
@@ -16,9 +18,14 @@ import tempfile
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
-McpServerResolver = Callable[[str], Awaitable[Mapping[str, Any]]]
+if TYPE_CHECKING:
+    from claude_agent_sdk.types import McpServerConfig
+
+McpServerResolver: TypeAlias = (
+    "Callable[[str], Awaitable[Mapping[str, McpServerConfig]]]"
+)
 """``resolve_mcp_servers(workspace)``: the complete external MCP servers for a
 new Claude connection in ``workspace``, as native ``McpServerConfig`` values."""
 
@@ -30,8 +37,12 @@ _KNOWN_STATUSES = _FAILED_STATUSES | {"connected", "pending"}
 
 
 class ClaudeMcpStartupError(RuntimeError):
-    """A Claude session's MCP servers could not be resolved, launched or
-    confirmed connected. Carries no callback, native status or error text."""
+    """A Claude session's MCP servers could not be resolved, launched, confirmed
+    connected or cleaned up. Carries no callback, native status or error text.
+
+    ``resume_eligible`` is set only when the native CLI failed to start, the one
+    case a resumed session may be retried as a fresh one.
+    """
 
     def __init__(
         self,
@@ -40,11 +51,13 @@ class ClaudeMcpStartupError(RuntimeError):
         *,
         server: str | None = None,
         error_type: str | None = None,
+        resume_eligible: bool = False,
     ) -> None:
         self.stage = stage
         self.reason = reason
         self.server = server
         self.error_type = error_type
+        self.resume_eligible = resume_eligible
         parts = [f"Claude MCP startup failed at {stage}: {reason}"]
         if server is not None:
             parts.append(f"server {server!r}")
@@ -53,23 +66,33 @@ class ClaudeMcpStartupError(RuntimeError):
         super().__init__(" ".join(parts))
 
 
+class _OwnedStartupError(ClaudeMcpStartupError):
+    """Built here from owner-known metadata only."""
+
+
 def startup_error(
     stage: str,
     reason: str,
     error: BaseException | None = None,
     *,
     server: str | None = None,
+    resume_eligible: bool = False,
 ) -> ClaudeMcpStartupError:
-    """A safe error for ``error``; raise it ``from None`` so its text, which may
-    hold credentials, never joins the chain."""
-    if isinstance(error, ClaudeMcpStartupError):
-        return error
-    return ClaudeMcpStartupError(
+    """A fresh safe error for ``error``, whatever its type; raise it ``from
+    None`` so the original text, which may hold credentials, never joins the
+    chain."""
+    return _OwnedStartupError(
         stage,
         reason,
         server=server,
         error_type=None if error is None else type(error).__name__,
+        resume_eligible=resume_eligible,
     )
+
+
+def is_safe_startup_error(error: BaseException) -> bool:
+    """Whether ``error`` was built by the owner, not handed in by a callback."""
+    return isinstance(error, _OwnedStartupError)
 
 
 def freeze_external_servers(
@@ -79,36 +102,48 @@ def freeze_external_servers(
 
     Later changes to the mappings, lists or headers the callback returned can't
     reach the launch. In-process ``sdk`` servers and names Band reserves are
-    refused by name.
+    refused by name. Anything the callback's objects raise while being read
+    becomes a safe error.
     """
+    try:
+        return _freeze(resolved, protected)
+    except _OwnedStartupError:
+        raise
+    except Exception as error:  # noqa: BLE001 -- the callback's objects may raise anything
+        raise startup_error(
+            "resolution", "the resolved servers could not be read", error
+        ) from None
+
+
+def _freeze(
+    resolved: object, protected: Mapping[str, Any]
+) -> dict[str, dict[str, Any]]:
     if not isinstance(resolved, Mapping):
-        raise ClaudeMcpStartupError(
+        raise startup_error(
             "resolution", "resolve_mcp_servers must return a mapping of servers"
         )
     frozen: dict[str, dict[str, Any]] = {}
     for name, config in resolved.items():
         if not isinstance(name, str) or not name:
-            raise ClaudeMcpStartupError("resolution", "server names must be strings")
+            raise startup_error("resolution", "server names must be strings")
         if name in protected:
-            raise ClaudeMcpStartupError(
+            raise startup_error(
                 "resolution", "the name is reserved for Band", server=name
             )
         if not isinstance(config, Mapping):
-            raise ClaudeMcpStartupError(
+            raise startup_error(
                 "resolution", "server config must be a mapping", server=name
             )
         kind = config.get("type", "stdio")
         if kind == "sdk":
-            raise ClaudeMcpStartupError(
+            raise startup_error(
                 "resolution", "in-process sdk servers are not supported", server=name
             )
         if kind not in _REMOTE_TYPES and kind != "stdio":
-            raise ClaudeMcpStartupError(
-                "resolution", "unsupported server type", server=name
-            )
+            raise startup_error("resolution", "unsupported server type", server=name)
         required = "command" if kind == "stdio" else "url"
         if not isinstance(config.get(required), str):
-            raise ClaudeMcpStartupError(
+            raise startup_error(
                 "resolution", f"server config needs a string {required}", server=name
             )
         try:
@@ -124,7 +159,8 @@ def freeze_external_servers(
 class McpConfigFile:
     """The private native ``--mcp-config`` file one connection launches with.
 
-    Owned until its child's exit is confirmed; then ``release`` removes it.
+    Owned until its child's exit is confirmed; then ``release`` removes it. A
+    release that fails raises and leaves it owned, for a later retry.
     """
 
     directory: Path
@@ -145,7 +181,14 @@ class McpConfigFile:
         return cls(directory=directory, path=path)
 
     def release(self) -> None:
-        shutil.rmtree(self.directory, ignore_errors=True)
+        try:
+            shutil.rmtree(self.directory)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise startup_error(
+                "cleanup", "the private MCP file could not be removed", error
+            ) from None
 
 
 def _check_status(
@@ -155,22 +198,22 @@ def _check_status(
     server failed. Only a unique ``connected`` entry per expected name counts."""
     servers = response.get("mcpServers") if isinstance(response, Mapping) else None
     if not isinstance(servers, list):
-        raise ClaudeMcpStartupError("status", "malformed status response")
+        raise startup_error("status", "malformed status response")
     seen: dict[str, str] = {}
     for entry in servers:
         if not isinstance(entry, Mapping):
-            raise ClaudeMcpStartupError("status", "malformed status entry")
+            raise startup_error("status", "malformed status entry")
         name, status = entry.get("name"), entry.get("status")
         if not isinstance(name, str) or not isinstance(status, str):
-            raise ClaudeMcpStartupError("status", "malformed status entry")
+            raise startup_error("status", "malformed status entry")
         if name not in expected:
             continue
         if name in seen:
-            raise ClaudeMcpStartupError("status", "duplicate status", server=name)
+            raise startup_error("status", "duplicate status", server=name)
         if status not in _KNOWN_STATUSES:
-            raise ClaudeMcpStartupError("status", "unknown status", server=name)
+            raise startup_error("status", "unknown status", server=name)
         if status in _FAILED_STATUSES:
-            raise ClaudeMcpStartupError("status", f"server is {status}", server=name)
+            raise startup_error("status", f"server is {status}", server=name)
         seen[name] = status
     for name in sorted(expected):
         if seen.get(name) != "connected":
@@ -192,14 +235,14 @@ async def await_mcp_ready(
     while True:
         remaining = deadline - loop.time()
         if remaining <= 0:
-            raise ClaudeMcpStartupError(
+            raise startup_error(
                 "status", "not connected before the deadline", server=waiting_on
             )
         try:
             async with asyncio.timeout(remaining):
                 response = await get_status()
         except TimeoutError:
-            raise ClaudeMcpStartupError(
+            raise startup_error(
                 "status", "not connected before the deadline", server=waiting_on
             ) from None
         except Exception as error:  # noqa: BLE001 -- any native status failure is a typed startup failure

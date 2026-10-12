@@ -109,6 +109,7 @@ from band.integrations.claude_sdk.dedup_tools import (
 from band.integrations.claude_sdk.mcp_startup import (
     ClaudeMcpStartupError,
     McpServerResolver,
+    is_safe_startup_error,
 )
 from band.integrations.claude_sdk.prompts import generate_claude_sdk_agent_prompt
 from band.integrations.claude_sdk.session_manager import (
@@ -629,6 +630,8 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         # a detached Band backend kept until its stop succeeds.
         self._teardown: asyncio.Task[None] | None = None
         self._retained_backend: BandMCPBackend | None = None
+        # Closed from a teardown request until a successful restart.
+        self._admission_closed = False
 
         # Per-room tools: the adapter's own sends use them directly, while the
         # MCP server's tool calls go through _mcp_room_tools (see _bind_mcp_tools).
@@ -773,6 +776,7 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
             workspaces=self._workspaces,
             resolve_mcp_servers=self._resolve_mcp_servers,
         )
+        self._admission_closed = False
 
         logger.info(
             "Claude SDK adapter started for agent: %s (model=%s, fallback_model=%s, thinking=%s, effort=%s, approval=%s)",
@@ -863,10 +867,13 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
                 "name": msg.sender_name or msg.sender_type,
             }
 
+        # Refused before it rebinds the room's tools: a turn arriving during
+        # (or after a failed) teardown must not retarget a retained server.
+        manager = self._require_admitting(self._session_manager)
         # The running turn's approvals and MCP calls keep their original tools.
         self._room_tools[room_id] = tools
         await self._bind_mcp_tools(room_id, tools)
-        manager = self._require_admitting(self._session_manager)
+        self._require_admitting(manager)
         await self._mcp.ensure()
         # A teardown or restart that began meanwhile owns the manager and the
         # Band server now; this turn must not start a session against them.
@@ -888,9 +895,13 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
             raise
         except Exception as error:
             if isinstance(error, ClaudeMcpStartupError):
-                # Its message is already safe; a traceback chain could carry
-                # callback or native text.
-                logger.error("Room %s: Session creation failed: %s", room_id, error)
+                # A traceback chain could carry callback or native text; only
+                # an owner-built message is rendered.
+                logger.error(
+                    "Room %s: Session creation failed: %s",
+                    room_id,
+                    error if is_safe_startup_error(error) else type(error).__name__,
+                )
             else:
                 logger.exception("Room %s: Session creation failed", room_id)
             await tools.send_failure(
@@ -991,10 +1002,25 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
             return await manager.get_or_create_session(
                 room_id, resume_session_id=resume_session_id
             )
-        except (ClaudeSessionManagerStoppedError, ClaudeMcpStartupError):
-            # Its MCP servers, not the history, failed: resuming without the
-            # history would fail the same way and lose the conversation.
+        except ClaudeSessionManagerStoppedError:
             raise
+        except ClaudeMcpStartupError as error:
+            # Resolution, its servers, readiness or retirement failed: resuming
+            # without the history would fail the same way and lose the
+            # conversation. Only the CLI itself failing to start may retry fresh.
+            if not (
+                resume_session_id
+                and error.resume_eligible
+                and is_safe_startup_error(error)
+            ):
+                raise
+            logger.warning(
+                "Room %s: Session resume failed (session_id=%s): %s. "
+                "Creating new session",
+                room_id,
+                resume_session_id,
+                error,
+            )
         except Exception as resume_exc:
             if not resume_session_id:
                 raise
@@ -1636,6 +1662,11 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         teardown from inside itself returns without waiting for it, since the
         teardown waits for that startup to settle.
         """
+        # Admission closes now, before anything settles: no turn or session
+        # startup may begin, or publish, behind this teardown.
+        self._admission_closed = True
+        if self._session_manager is not None:
+            self._session_manager.close_admission()
         teardown = self._teardown
         if teardown is None or teardown.done():
             teardown = asyncio.create_task(self._tear_down(), name="claude-teardown")
@@ -1676,14 +1707,14 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
     def _require_admitting(
         self, manager: ClaudeSessionManager | None
     ) -> ClaudeSessionManager:
-        """``manager``, while it is still the adapter's and no teardown runs."""
+        """``manager``, while it is still the adapter's and admission is open:
+        it closes when a teardown is requested and reopens only on a successful
+        restart (``on_started``), so a failed teardown keeps it closed."""
         if manager is None:
             raise RuntimeError(
                 "ClaudeSDKAdapter session manager not initialized — was on_started() called?"
             )
-        if manager is not self._session_manager or (
-            self._teardown is not None and not self._teardown.done()
-        ):
+        if manager is not self._session_manager or self._admission_closed:
             raise ClaudeSessionManagerStoppedError()
         return manager
 

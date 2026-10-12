@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -64,9 +67,12 @@ class ForgetfulProcess(WorkspaceProcess):
         self._process = None
 
 
+@asynccontextmanager
 async def started(
     child_type: type[WorkspaceProcess], tmp_path: Path
-) -> tuple[transport.ConfirmedCloseTransport, WorkspaceProcess]:
+) -> AsyncIterator[tuple[transport.ConfirmedCloseTransport, WorkspaceProcess]]:
+    """An owned transport over a real child, reaped on exit whatever the test
+    asserted."""
     native = child_type(
         prompt="",
         options=ClaudeAgentOptions(
@@ -75,51 +81,82 @@ async def started(
     )
     owned = transport.ConfirmedCloseTransport(native)
     await owned.connect()
-    return owned, native
+    child = native._child
+    try:
+        yield owned, native
+    finally:
+        if child.returncode is None:
+            child.kill()
+            await child.wait()
 
 
 async def test_a_close_that_falsely_succeeds_still_reaps_the_child(
     tmp_path: Path,
 ) -> None:
-    owned, native = await started(ForgetfulProcess, tmp_path)
+    async with started(ForgetfulProcess, tmp_path) as (owned, native):
+        await owned.close()
 
-    await owned.close()
-
-    assert native.exited
-    assert not owned.close_pending
+        assert native.exited
+        assert not owned.close_pending
 
 
 async def test_an_unconfirmed_exit_keeps_the_child_for_a_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    owned, native = await started(ForgetfulProcess, tmp_path)
-    child = native._child
-    real_kill = child.kill
-    monkeypatch.setattr(child, "kill", lambda: (_ for _ in ()).throw(PermissionError()))
+    async with started(ForgetfulProcess, tmp_path) as (owned, native):
+        child = native._child
+        real_kill = child.kill
+        monkeypatch.setattr(
+            child, "kill", lambda: (_ for _ in ()).throw(PermissionError())
+        )
 
-    with pytest.raises(transport.ClaudeProcessCloseError):
+        with pytest.raises(transport.ClaudeProcessCloseError):
+            await owned.close()
+        assert owned.close_pending
+        assert not native.exited
+
+        monkeypatch.setattr(child, "kill", real_kill)
         await owned.close()
-    assert owned.close_pending
-    assert not native.exited
 
-    monkeypatch.setattr(child, "kill", real_kill)
-    await owned.close()
+        assert native.exited
+        assert not owned.close_pending
 
-    assert native.exited
-    assert not owned.close_pending
+
+async def test_an_exit_that_never_confirms_fails_within_the_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(transport, "CHILD_EXIT_TIMEOUT_SECONDS", 0.2)
+    async with started(ForgetfulProcess, tmp_path) as (owned, native):
+        child = native._child
+        real_wait = child.wait
+
+        async def never() -> int:
+            await asyncio.Event().wait()
+            return 0
+
+        monkeypatch.setattr(child, "wait", never)
+        async with asyncio.timeout(5):
+            with pytest.raises(transport.ClaudeProcessCloseError):
+                await owned.close()
+        assert owned.close_pending
+
+        monkeypatch.setattr(child, "wait", real_wait)
+        await owned.close()
+        assert native.exited
+        assert not owned.close_pending
 
 
 async def test_a_close_that_raised_keeps_the_child_for_a_retry(tmp_path: Path) -> None:
-    owned, native = await started(WorkspaceProcess, tmp_path)
-    native.refuse_close = True
+    async with started(WorkspaceProcess, tmp_path) as (owned, native):
+        native.refuse_close = True
 
-    with pytest.raises(RuntimeError, match="cleanup failed"):
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            await owned.close()
+        assert owned.close_pending
+        assert not native.exited
+
+        native.refuse_close = False
         await owned.close()
-    assert owned.close_pending
-    assert not native.exited
 
-    native.refuse_close = False
-    await owned.close()
-
-    assert native.exited
-    assert not owned.close_pending
+        assert native.exited
+        assert not owned.close_pending

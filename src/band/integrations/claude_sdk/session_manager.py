@@ -31,6 +31,7 @@ from band.integrations.claude_sdk.mcp_startup import (
     McpServerResolver,
     await_mcp_ready,
     freeze_external_servers,
+    is_safe_startup_error,
     startup_error,
 )
 from band.workspaces import RoomWorkspaces
@@ -93,9 +94,43 @@ class RoomStartup:
     # itself), so no owner injects another one into its settlement.
     cancel_requested: bool = False
     worker: asyncio.Task[None] | None = None
+    # What it launched (until published or closed).
     client: ClaudeSDKClient | None = None
     transport: Transport | None = None
     config_file: McpConfigFile | None = None
+    # The room's outdated or unusable client it replaces, closed by its worker
+    # through the queue before anything new launches.
+    stale_client: ClaudeSDKClient | None = None
+    stale_transport: Transport | None = None
+    stale_config_file: McpConfigFile | None = None
+
+    @property
+    def owns_handles(self) -> bool:
+        return any(
+            handle is not None
+            for handle in (
+                self.client,
+                self.transport,
+                self.config_file,
+                self.stale_client,
+                self.stale_transport,
+                self.stale_config_file,
+            )
+        )
+
+    def take_stale(
+        self,
+    ) -> tuple[ClaudeSDKClient | None, Transport | None, McpConfigFile | None]:
+        handles = (self.stale_client, self.stale_transport, self.stale_config_file)
+        self.stale_client = self.stale_transport = self.stale_config_file = None
+        return handles
+
+    def take_launched(
+        self,
+    ) -> tuple[ClaudeSDKClient | None, Transport | None, McpConfigFile | None]:
+        handles = (self.client, self.transport, self.config_file)
+        self.client = self.transport = self.config_file = None
+        return handles
 
     def retire(self) -> None:
         """Close admission and see the worker cancelled at most once; a worker
@@ -213,10 +248,22 @@ class ClaudeSessionManager:
 
     def is_startup_task(self, task: asyncio.Task[Any] | None) -> bool:
         """Whether ``task`` is a session startup this manager's teardown waits
-        for; such a task must request teardown without waiting on it."""
-        return task is not None and any(
-            startup.worker is task for startup in self._startups.values()
-        )
+        for (registered, or already held by a room retirement); such a task
+        must request teardown without waiting on it."""
+        if task is None:
+            return False
+        startups = [
+            *self._startups.values(),
+            *(r.startup for r in self._retirements.values() if r.startup is not None),
+        ]
+        return any(startup.worker is task for startup in startups)
+
+    def close_admission(self) -> None:
+        """Refuse every new session from now on and retire every startup; the
+        settlement itself is ``stop``'s."""
+        self._closing = True
+        for startup in list(self._startups.values()):
+            startup.retire()
 
     async def start(self) -> None:
         """Start the background task that manages all sessions."""
@@ -236,9 +283,7 @@ class ClaudeSessionManager:
         Admission closes at once. A session startup that asks for the stop
         from inside itself returns without waiting for the shutdown, which
         waits for that startup to settle."""
-        self._closing = True
-        for startup in list(self._startups.values()):
-            startup.retire()
+        self.close_admission()
         if self._shutdown is None or (
             self._shutdown.done() and self._shutdown.exception() is not None
         ):
@@ -383,18 +428,21 @@ class ClaudeSessionManager:
         if room_id in self._retirements:
             return _RETRY
 
-        if (client := self._sessions.get(room_id)) is not None:
-            if room_id not in self._unusable and self._is_current(room_id, client):
-                logger.debug("Reusing existing session for room: %s", room_id)
-                return client
-            logger.info("Replacing unusable or outdated session for room %s", room_id)
-            await self._do_cleanup_session(room_id, release_workspace=False)
-
         if (startup := self._startups.get(room_id)) is not None:
             if startup.closing:
                 return _RETRY
             startup.waiters += 1
             return startup
+
+        stale: tuple[Any, Any, Any] = (None, None, None)
+        if (client := self._sessions.get(room_id)) is not None:
+            if room_id not in self._unusable and self._is_current(room_id, client):
+                logger.debug("Reusing existing session for room: %s", room_id)
+                return client
+            logger.info("Replacing unusable or outdated session for room %s", room_id)
+            # The replacement owns the old client from here: its worker closes
+            # it through the queue before launching, so nothing here awaits.
+            stale = self._take_session(room_id)
 
         if resume_session_id:
             logger.info("Resuming session %s for room: %s", resume_session_id, room_id)
@@ -408,6 +456,9 @@ class ClaudeSessionManager:
             protected=self._protected_identity(room_id),
             result=asyncio.get_running_loop().create_future(),
             waiters=1,
+            stale_client=stale[0],
+            stale_transport=stale[1],
+            stale_config_file=stale[2],
         )
         self._startups[room_id] = startup
         startup.worker = asyncio.create_task(
@@ -434,11 +485,15 @@ class ClaudeSessionManager:
     # -- startup worker (outside the queue) ----------------------------------
 
     def _require_live(self, startup: RoomStartup) -> None:
+        worker = startup.worker
         if (
             startup.closing
             or self._closing
             or self._startups.get(startup.room_id) is not startup
             or startup.waiters <= 0
+            # A cancellation of this very invocation is still outstanding,
+            # even if the callback caught it: its result is never used.
+            or (worker is not None and worker.cancelling() > 0)
         ):
             raise _StartupRetired
         if startup.protected != self._protected_identity(startup.room_id):
@@ -461,12 +516,18 @@ class ClaudeSessionManager:
     async def _run_startup(self, startup: RoomStartup) -> None:
         room_id = startup.room_id
         try:
+            if (
+                startup.stale_client is not None
+                or startup.stale_config_file is not None
+            ):
+                await self._in_queue(lambda: self._do_close_stale(startup))
+            self._require_live(startup)
             external: dict[str, Any] | None = None
             if self._resolve_mcp_servers is not None:
                 workspace = self._startup_workspace(room_id)
                 try:
                     resolved = await self._resolve_mcp_servers(workspace)
-                except Exception as error:  # noqa: BLE001 -- any callback failure is a typed startup failure
+                except Exception as error:  # noqa: BLE001 -- any callback failure, even a typed one, is untrusted
                     raise startup_error(
                         "resolution", "resolve_mcp_servers failed", error
                     ) from None
@@ -477,7 +538,13 @@ class ClaudeSessionManager:
                 client = startup.client
                 assert client is not None
                 expected = frozenset({*external, *(startup.protected or {})})
-                await await_mcp_ready(client.get_mcp_status, expected)
+                try:
+                    await await_mcp_ready(client.get_mcp_status, expected)
+                except ClaudeMcpStartupError:
+                    # A server that failed because the startup was retired or
+                    # its Band server replaced meanwhile is that, not a failure.
+                    self._require_live(startup)
+                    raise
             self._require_live(startup)
             self._publish(startup)
         except BaseException as error:
@@ -498,9 +565,14 @@ class ClaudeSessionManager:
         room_id = startup.room_id
         mcp_servers: Any = None
         if external is not None:
-            startup.config_file = McpConfigFile.create(
-                {**external, **(startup.protected or {})}
-            )
+            try:
+                startup.config_file = McpConfigFile.create(
+                    {**external, **(startup.protected or {})}
+                )
+            except Exception as error:  # noqa: BLE001 -- a safe error, whatever failed
+                raise startup_error(
+                    "launch", "the private MCP file could not be written", error
+                ) from None
             mcp_servers = str(startup.config_file.path)
         options = self._build_options(
             room_id, startup.resume_session_id, mcp_servers=mcp_servers
@@ -512,8 +584,13 @@ class ClaudeSessionManager:
             await startup.client.connect()
         except Exception as error:
             if external is not None:
+                # The CLI itself failed to start (a missing session to resume
+                # among the causes): the one failure a fresh session may retry.
                 raise startup_error(
-                    "launch", "the Claude CLI did not start", error
+                    "launch",
+                    "the Claude CLI did not start",
+                    error,
+                    resume_eligible=True,
                 ) from None
             raise
         self._require_live(startup)
@@ -542,11 +619,12 @@ class ClaudeSessionManager:
     async def _discard_startup(
         self, startup: RoomStartup, error: BaseException
     ) -> None:
-        """Close what the startup launched and hand its waiters the outcome.
+        """Close what the startup owns and hand its waiters the outcome.
 
         A close that fails keeps the client, child and file as the room's
-        unusable session, so a later cleanup retries them."""
-        if startup.client is not None or startup.config_file is not None:
+        unusable session (or file), so a later cleanup retries them; the
+        waiters still get the startup's own outcome."""
+        if startup.owns_handles:
             try:
                 await self._in_queue(lambda: self._do_close_startup(startup))
             except BaseException:  # noqa: BLE001 -- custody is kept; the waiters still get the outcome
@@ -562,40 +640,24 @@ class ClaudeSessionManager:
                 startup.result.set_exception(
                     ClaudeSessionManagerStoppedError()
                     if self._closing
-                    else ClaudeMcpStartupError(
-                        "retirement", "the room's startup was retired"
-                    )
+                    else startup_error("retirement", "the room's startup was retired")
                 )
             else:
                 startup.result.set_exception(error)
             # No waiter may be left to read it; mark the outcome retrieved.
             startup.result.exception()
 
+    async def _do_close_stale(self, startup: RoomStartup) -> None:
+        """Close the client this startup replaces (in the queue)."""
+        client, transport, config_file = startup.take_stale()
+        await self._close_handles(startup.room_id, client, transport, config_file)
+
     async def _do_close_startup(self, startup: RoomStartup) -> None:
-        """Close an unpublished client (in the queue), keeping custody on failure."""
-        room_id = startup.room_id
-        client, transport = startup.client, startup.transport
-        try:
-            if client is not None:
-                try:
-                    await client.disconnect()
-                finally:
-                    if transport is not None:
-                        await transport.close()
-        except BaseException:
-            if client is not None and room_id not in self._sessions:
-                self._sessions[room_id] = client
-                if transport is not None:
-                    self._transports[room_id] = transport
-                if startup.config_file is not None:
-                    self._config_files[room_id] = startup.config_file
-                self._unusable.add(room_id)
-                startup.client = startup.transport = startup.config_file = None
-            raise
-        startup.client = startup.transport = None
-        if startup.config_file is not None:
-            startup.config_file.release()
-            startup.config_file = None
+        """Close whatever the startup still owns (in the queue); a failure
+        moves it to the room's retained session first."""
+        await self._do_close_stale(startup)
+        client, transport, config_file = startup.take_launched()
+        await self._close_handles(startup.room_id, client, transport, config_file)
 
     # -- retirement -----------------------------------------------------------
 
@@ -622,8 +684,13 @@ class ClaudeSessionManager:
     ) -> _Retirement:
         """Close the room's admission now; settle its startup and clean it up
         in one durable task that every caller joins."""
-        if (retirement := self._retirements.get(room_id)) is not None:
+        retirement = self._retirements.get(room_id)
+        if retirement is not None and not retirement.task.done():
             return retirement
+        if retirement is not None:
+            # Finished, its removal callback not yet run: reap it here so a
+            # caller asking for more (releasing the claim) gets fresh work.
+            del self._retirements[room_id]
         startup = self._startups.get(room_id)
         if startup is not None:
             startup.retire()
@@ -665,22 +732,81 @@ class ClaudeSessionManager:
 
     # -- native custody (queue) ----------------------------------------------
 
+    def _cleanup_error(self, error: BaseException) -> BaseException:
+        """With a resolver, a close failure's text may name credentials: it is
+        replaced by a safe error. Cancellation passes through."""
+        if self._resolve_mcp_servers is None or not isinstance(error, Exception):
+            return error
+        if isinstance(error, ClaudeMcpStartupError) and is_safe_startup_error(error):
+            return error
+        return startup_error("cleanup", "the Claude CLI could not be closed", error)
+
+    def _retain(
+        self,
+        room_id: str,
+        client: ClaudeSDKClient | None,
+        transport: Transport | None,
+        config_file: McpConfigFile | None,
+    ) -> None:
+        """Keep handles whose close failed as the room's unusable session (and
+        its file), so a later cleanup retries them."""
+        if client is not None and room_id not in self._sessions:
+            self._sessions[room_id] = client
+            self._unusable.add(room_id)
+            if transport is not None:
+                self._transports[room_id] = transport
+        if config_file is not None and room_id not in self._config_files:
+            self._config_files[room_id] = config_file
+
+    async def _close_handles(
+        self,
+        room_id: str,
+        client: ClaudeSDKClient | None,
+        transport: Transport | None,
+        config_file: McpConfigFile | None,
+        *,
+        disconnect: bool = True,
+    ) -> None:
+        """Close a client and its transport, then remove its file (in the
+        queue). Whatever can't be confirmed closed or removed stays owned."""
+        try:
+            try:
+                if disconnect and client is not None:
+                    await client.disconnect()
+            finally:
+                if transport is not None:
+                    await transport.close()
+        except BaseException as error:
+            self._retain(room_id, client, transport, config_file)
+            safe = self._cleanup_error(error)
+            if safe is error:
+                raise
+            raise safe from None
+        if config_file is not None:
+            try:
+                config_file.release()
+            except BaseException:
+                self._retain(room_id, None, None, config_file)
+                raise
+
+    def _take_session(
+        self, room_id: str
+    ) -> tuple[ClaudeSDKClient | None, Transport | None, McpConfigFile | None]:
+        self._identities.pop(room_id, None)
+        self._unusable.discard(room_id)
+        return (
+            self._sessions.pop(room_id, None),
+            self._transports.pop(room_id, None),
+            self._config_files.pop(room_id, None),
+        )
+
     async def _do_invalidate_session(self, room_id: str | None) -> None:
         """Evict an exited CLI while retaining the room's workspace."""
         if not room_id:
             return
-        if (transport := self._transports.get(room_id)) is not None:
-            self._unusable.add(room_id)
-            await transport.close()
-            del self._transports[room_id]
-        self._sessions.pop(room_id, None)
-        self._identities.pop(room_id, None)
-        self._release_config_file(room_id)
-        self._unusable.discard(room_id)
-
-    def _release_config_file(self, room_id: str) -> None:
-        if (config_file := self._config_files.pop(room_id, None)) is not None:
-            config_file.release()
+        await self._close_handles(
+            room_id, *self._take_session(room_id), disconnect=False
+        )
 
     async def _do_cleanup_session(
         self, room_id: str | None, *, release_workspace: bool = True
@@ -689,18 +815,7 @@ class ClaudeSessionManager:
         retried."""
         if not room_id:
             return
-        if (client := self._sessions.get(room_id)) is not None:
-            self._unusable.add(room_id)
-            try:
-                await client.disconnect()
-            finally:
-                if (transport := self._transports.get(room_id)) is not None:
-                    await transport.close()
-            del self._sessions[room_id]
-            self._transports.pop(room_id, None)
-            self._identities.pop(room_id, None)
-            self._release_config_file(room_id)
-            self._unusable.discard(room_id)
+        await self._close_handles(room_id, *self._take_session(room_id))
         if (
             release_workspace
             and self._workspaces is not None
@@ -710,7 +825,7 @@ class ClaudeSessionManager:
 
     async def _do_cleanup_all(self) -> None:
         """Attempt every room, reporting failures without discarding ownership."""
-        rooms = dict.fromkeys(self._sessions)
+        rooms = dict.fromkeys([*self._sessions, *self._config_files])
         if self._workspaces is not None:
             rooms.update(dict.fromkeys(self._workspaces.rooms))
         errors: list[Exception] = []
@@ -803,9 +918,14 @@ class ClaudeSessionManager:
         """
         if not self._loop_running:
             return
-        startup = self._startups.get(room_id)
-        self_requested = (
-            startup is not None and startup.worker is asyncio.current_task()
+        current = asyncio.current_task()
+        held = self._retirements.get(room_id)
+        self_requested = any(
+            candidate is not None and candidate.worker is current
+            for candidate in (
+                self._startups.get(room_id),
+                None if held is None else held.startup,
+            )
         )
         while True:
             retirement = self._begin_room_retirement(

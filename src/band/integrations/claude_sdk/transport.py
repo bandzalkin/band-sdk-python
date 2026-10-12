@@ -3,6 +3,7 @@ custody of the CLI child until its exit is confirmed."""
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 from typing import Any
@@ -11,6 +12,9 @@ from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk._internal.transport import Transport
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 from claude_agent_sdk.types import _configure_can_use_tool
+
+CHILD_EXIT_TIMEOUT_SECONDS = 5.0
+"""How long a child the native close left running may take to die once killed."""
 
 
 class ClaudeProcessCloseError(RuntimeError):
@@ -67,6 +71,8 @@ class ConfirmedCloseTransport(Transport):
         await self._confirm_exit()
 
     async def _confirm_exit(self) -> None:
+        """Kill and reap a child the native close left running, within
+        ``CHILD_EXIT_TIMEOUT_SECONDS``; otherwise keep it and raise."""
         child = self._child
         if child is None:
             return
@@ -74,11 +80,13 @@ class ConfirmedCloseTransport(Transport):
             try:
                 with contextlib.suppress(ProcessLookupError):
                     child.kill()
-                await child.wait()
-            except Exception as error:
+                async with asyncio.timeout(CHILD_EXIT_TIMEOUT_SECONDS):
+                    await child.wait()
+            except Exception as error:  # noqa: BLE001 -- unconfirmed exit, whatever the cause
                 raise ClaudeProcessCloseError(
                     "the Claude CLI process could not be confirmed exited"
-                ) from error
+                    f" ({type(error).__name__})"
+                ) from None
         self._child = None
 
 

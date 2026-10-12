@@ -123,6 +123,9 @@ class FakeClaude:
         # Scripted mcp_status replies, one per request; the last one repeats.
         self.mcp_statuses: deque[list[dict[str, Any]]] = deque()
         self.status_requests = 0
+        # Parks every mcp_status answer; or answers it with a control error.
+        self.status_hold: Hold | None = None
+        self.status_unsupported = False
 
     def script(self, *turns: Turn) -> None:
         self._turns.extend(turns)
@@ -196,6 +199,11 @@ class FakeCLISession(Transport):
         self.alive = False
         if self._turn is not None:
             self._turn.cancel()
+        # The process is gone: so are the answers it was still preparing.
+        for task in list(self._status_tasks):
+            task.cancel()
+        if self._status_tasks:
+            await asyncio.wait(self._status_tasks)
         self._outbox.put_nowait(None)
 
     def die(self) -> None:
@@ -229,9 +237,9 @@ class FakeCLISession(Transport):
         if request["subtype"] == "initialize":
             self._hooks = request.get("hooks") or {}
         if request["subtype"] == "mcp_status":
-            self._status_tasks.add(
-                asyncio.create_task(self._answer_status(message["request_id"]))
-            )
+            task = asyncio.create_task(self._answer_status(message["request_id"]))
+            self._status_tasks.add(task)
+            task.add_done_callback(self._status_tasks.discard)
             return
         self._emit(
             type="control_response",
@@ -496,6 +504,19 @@ class FakeCLISession(Transport):
         return {"mcpServers": entries}
 
     async def _answer_status(self, request_id: str) -> None:
+        if (hold := self.claude.status_hold) is not None:
+            hold.reached.set()
+            await hold.released.wait()
+        if self.claude.status_unsupported:
+            self._emit(
+                type="control_response",
+                response={
+                    "subtype": "error",
+                    "request_id": request_id,
+                    "error": "Unsupported control request subtype: mcp_status",
+                },
+            )
+            return
         self._emit(
             type="control_response",
             response={
