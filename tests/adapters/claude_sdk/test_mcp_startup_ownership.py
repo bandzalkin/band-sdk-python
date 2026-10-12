@@ -647,3 +647,82 @@ async def test_a_callback_closing_admission_stops_everything_after_it(
     assert not manager.owns_resources()
     assert all(not s.alive for s in claude.sessions)
     assert list(owned_tmp.glob("band-claude-mcp-*")) == []
+
+
+class ReuseProbe:
+    """Stands in for a held client whose comparison answers with the client
+    itself, so the reuse decision stays this object until it is tested for
+    truth. CPython runs no ``__bool__`` while an ``and`` chain evaluates such an
+    operand: the read lands wherever the decision is used. Closing admission
+    from the second read models a callback that acts only when the decision is
+    read again after the final admission guard; the first read is the early
+    control."""
+
+    def __init__(self, manager: ClaudeSessionManager, mode: str) -> None:
+        self.manager = manager
+        self.mode = mode
+        self.order = 0
+        self.evaluations: list[int] = []
+        self.options = ClaudeAgentOptions(mcp_servers=dict(BAND))
+
+    def _decide(self) -> bool:
+        self.order += 1
+        self.evaluations.append(self.order)
+        late = self.order > 1
+        if (self.mode == "deferred" and late) or (
+            self.mode == "materialized" and not late
+        ):
+            self.manager.close_admission()
+        return True
+
+    def __eq__(self, other: object) -> Any:
+        return self
+
+    def __bool__(self) -> bool:
+        return self._decide()
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize("mode", ["materialized", "deferred"])
+async def test_the_reuse_decision_is_a_plain_bool_by_the_final_guard(
+    tmp_path: Path,
+    claude: FakeClaude,
+    mode: str,
+) -> None:
+    """The reuse decision is reduced to a plain bool once, inside the fallible
+    prerequisite boundary, before the callback-free admission guard. An object
+    answering the currentness comparison cannot defer its effect to the later
+    branch test: closing there still returns nothing (the deferred case), and
+    closing on the first read is refused outright (the control)."""
+    holder: dict[str, ReuseProbe] = {}
+
+    def band(room_id: str) -> Any:
+        return holder.get("probe", BAND)
+
+    manager = ClaudeSessionManager(
+        ClaudeAgentOptions(),
+        mcp_servers_factory=band,
+        workspaces=RoomWorkspaces(lambda room_id: str(tmp_path / room_id)),
+    )
+    claude.mcp_statuses.append([{"name": BAND_MCP_SERVER_NAME, "status": "connected"}])
+    try:
+        first = await manager.get_or_create_session("room-a")
+        assert first is not None
+        sessions_before = len(claude.sessions)
+        probe = holder["probe"] = ReuseProbe(manager, mode)
+        manager._sessions["room-a"] = probe
+        if mode == "materialized":  # closes while the decision is materialized
+            with pytest.raises(ClaudeSessionManagerStoppedError):
+                await manager.get_or_create_session("room-a")
+        else:  # the attack: a second read, after the final guard
+            assert await manager.get_or_create_session("room-a") is probe, (
+                "a client was returned after admission closed"
+            )
+            assert not manager._closing
+        assert probe.evaluations
+    finally:
+        manager._sessions.pop("room-a", None)
+        await manager.stop()
+    assert len(claude.sessions) == sessions_before
+    assert not manager.owns_resources()

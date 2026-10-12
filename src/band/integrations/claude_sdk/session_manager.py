@@ -440,7 +440,7 @@ class ClaudeSessionManager:
         protected: Any = None
         try:
             client = self._sessions.get(room_id)
-            reusable = (
+            reusable = bool(
                 client is not None
                 and room_id not in self._unusable
                 and self._is_current(room_id, client)

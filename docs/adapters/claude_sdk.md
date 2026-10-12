@@ -113,7 +113,8 @@ reuse the failed client or take another room's claimed directory.
   the adapter; that request returns without waiting on the startup it came from.
   Admission is rechecked, without calling out, after every callback the startup
   runs: a callback that closes admission or retires the room stops any later
-  reuse, client construction or publication.
+  reuse, client construction or publication. The reuse decision is settled to a
+  plain yes/no before that last check, so reading it again calls nothing.
 - **Teardown keeps what it can't release.** `cleanup_all()` refuses new turns
   and session startups as soon as it is called, and keeps refusing them until a
   successful `on_started`. A CLI whose exit can't be confirmed within 5 seconds of
