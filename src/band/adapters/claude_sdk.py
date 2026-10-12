@@ -900,7 +900,7 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
                 logger.error(
                     "Room %s: Session creation failed: %s",
                     room_id,
-                    error if is_safe_startup_error(error) else type(error).__name__,
+                    error if is_safe_startup_error(error) else "an untrusted error",
                 )
             else:
                 logger.exception("Room %s: Session creation failed", room_id)

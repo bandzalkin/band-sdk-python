@@ -101,15 +101,31 @@ def startup_error(
     )
 
 
-_KNOWN_ERROR_MODULES = ("builtins", "asyncio", "claude_agent_sdk", "anyio", "band")
+# Literal labels for exactly these classes. An error is matched by the
+# identity of its class alone -- never its name, module or other metadata,
+# which a callback's own class can set (or compute) to anything.
+_LABELLED_ERRORS: tuple[tuple[type[BaseException], str], ...] = (
+    (LookupError, "LookupError"),
+    (KeyError, "KeyError"),
+    (IndexError, "IndexError"),
+    (TypeError, "TypeError"),
+    (ValueError, "ValueError"),
+    (RuntimeError, "RuntimeError"),
+    (OSError, "OSError"),
+    (PermissionError, "PermissionError"),
+    (FileNotFoundError, "FileNotFoundError"),
+    (ConnectionError, "ConnectionError"),
+    (TimeoutError, "TimeoutError"),
+)
 
 
 def _known_type_name(error: BaseException | None) -> str | None:
     if error is None:
         return None
-    module = type(error).__module__
-    if module.split(".")[0] in _KNOWN_ERROR_MODULES:
-        return type(error).__name__
+    cls = type(error)
+    for known, label in _LABELLED_ERRORS:
+        if cls is known:
+            return label
     return None
 
 

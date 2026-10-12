@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -575,3 +576,74 @@ async def test_a_failed_reservation_keeps_what_the_room_still_holds(
         band.failing = False
         await manager.stop()
     assert not manager.owns_resources()
+
+
+@pytest.mark.parametrize(
+    "phase", ["reservation", "reuse", "pre-launch", "construction", "post-status"]
+)
+async def test_a_callback_closing_admission_stops_everything_after_it(
+    tmp_path: Path,
+    claude: FakeClaude,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    """A callback the manager runs closes its admission mid-startup: nothing
+    is constructed, reused or published after that."""
+    owned_tmp = tmp_path / "tmp"
+    owned_tmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(owned_tmp))
+    armed = {"on": phase == "reservation"}
+    manager_ref: list[ClaudeSessionManager] = []
+    resolutions: list[str] = []
+
+    def band(room_id: str) -> dict[str, Any]:
+        if armed["on"] or (phase == "post-status" and claude.status_requests > 0):
+            manager_ref[0].close_admission()
+        return dict(BAND)
+
+    async def resolver(workspace: str) -> Mapping[str, Any]:
+        resolutions.append(workspace)
+        if phase == "pre-launch":
+            armed["on"] = True
+        return {}
+
+    async def allow(*args: Any) -> Any:
+        return None
+
+    def permissions(room_id: str) -> Any:
+        if phase == "construction" and resolutions:
+            manager_ref[0].close_admission()
+        return allow
+
+    claude.mcp_statuses.append([{"name": BAND_MCP_SERVER_NAME, "status": "connected"}])
+    manager = ClaudeSessionManager(
+        ClaudeAgentOptions(),
+        can_use_tool_factory=permissions,
+        mcp_servers_factory=band,
+        workspaces=RoomWorkspaces(lambda room_id: str(tmp_path / room_id)),
+        resolve_mcp_servers=resolver,
+    )
+    manager_ref.append(manager)
+    try:
+        if phase == "reuse":
+            await manager.get_or_create_session("room-a")
+            armed["on"] = True
+        sessions_before = len(claude.sessions)
+        with pytest.raises(ClaudeSessionManagerStoppedError):
+            async with asyncio.timeout(10):
+                await manager.get_or_create_session("room-a")
+
+        if phase == "post-status":
+            # Built and confirmed, then refused instead of published.
+            assert len(claude.sessions) == 1
+            assert not claude.sessions[0].alive
+        else:
+            assert len(claude.sessions) == sessions_before
+        if phase == "reservation":
+            assert resolutions == []
+        assert not manager.has_session("room-a") or phase == "reuse"
+    finally:
+        await manager.stop()
+    assert not manager.owns_resources()
+    assert all(not s.alive for s in claude.sessions)
+    assert list(owned_tmp.glob("band-claude-mcp-*")) == []

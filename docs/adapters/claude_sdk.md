@@ -97,9 +97,11 @@ reuse the failed client or take another room's claimed directory.
   - The session is used only after every server, Band's included, reports
     `connected` through the CLI's `mcp_status`; anything else within 30 seconds
     (each status request included) fails the turn. Errors and logs name the
-    stage, server and, for builtin or library errors, the exception type --
-    never callback values, credentials or native error text, even for a
-    `ClaudeMcpStartupError` the callback raised.
+    stage and server, and the exception type only when it is exactly one of a
+    few builtin classes (such as `LookupError` or `OSError`); they never read
+    an exception's own name or module, and never carry callback values,
+    credentials or native error text, even for a `ClaudeMcpStartupError` the
+    callback raised.
   - External tools stay under `permission_mode` and `approvals`; they are never
     added to the tool allowlist.
 - **A starting connection is owned until it settles.** Callers for a room share
@@ -109,6 +111,9 @@ reuse the failed client or take another room's claimed directory.
   publishes nothing, is cancelled at most once, and keeps its process, file and
   workspace claim until it settles. A callback may itself clean up its room or
   the adapter; that request returns without waiting on the startup it came from.
+  Admission is rechecked, without calling out, after every callback the startup
+  runs: a callback that closes admission or retires the room stops any later
+  reuse, client construction or publication.
 - **Teardown keeps what it can't release.** `cleanup_all()` refuses new turns
   and session startups as soon as it is called, and keeps refusing them until a
   successful `on_started`. A CLI whose exit can't be confirmed within 5 seconds of

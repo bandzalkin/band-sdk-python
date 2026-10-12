@@ -44,6 +44,16 @@ GRANT_A = "grant-a-5ecret"
 GRANT_B = "grant-b-5ecret"
 
 
+@pytest.fixture(autouse=True)
+def private_tempdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Private MCP files go to test-owned storage, so their inventory never
+    sees another process's files in the host's temp directory."""
+    owned = tmp_path / "tmp"
+    owned.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(owned))
+    return owned
+
+
 class Resolver:
     """Returns ``servers`` and records each workspace it was asked for."""
 
@@ -843,3 +853,53 @@ async def test_a_non_string_server_type_is_refused_by_name(
     assert not caught.value.resume_eligible
     assert len(calls) == 1
     assert claude.sessions == []
+
+
+class _ExplodingMeta(type):
+    """A metaclass whose class metadata raises a secret-bearing error."""
+
+    def __getattribute__(cls, name: str) -> Any:
+        if name in {"__module__", "__name__", "__qualname__"}:
+            raise LookupError(f"meta said {GRANT_A}")
+        return super().__getattribute__(name)
+
+
+def metadata_attack(kind: str) -> BaseException:
+    secret_name = f"Leak_{GRANT_A.replace('-', '_')}"
+    if kind == "spoofed-module":
+        cls = type(secret_name, (Exception,), {"__module__": "builtins"})
+    elif kind == "non-string-module":
+        cls = type(secret_name, (Exception,), {"__module__": 3})
+    else:
+        cls = _ExplodingMeta(secret_name, (Exception,), {})
+    return cls()
+
+
+@pytest.mark.parametrize(
+    "kind", ["spoofed-module", "non-string-module", "raising-metaclass"]
+)
+async def test_an_error_classs_own_metadata_is_never_read(
+    claude_room: OpenRoom,
+    claude: FakeClaude,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    calls: list[str] = []
+
+    async def resolver(workspace: str) -> Mapping[str, Any]:
+        calls.append(workspace)
+        raise metadata_attack(kind)
+
+    room = await claude_room(resolve_mcp_servers=resolver)
+    with caplog.at_level(logging.DEBUG), pytest.raises(ClaudeMcpStartupError) as caught:
+        await room.send("hi", session_id="sess-earlier")
+
+    assert caught.value.stage == "resolution"
+    assert caught.value.error_type is None
+    assert not caught.value.resume_eligible
+    assert len(calls) == 1
+    assert claude.sessions == []
+    assert_secret_free(GRANT_A, caught.value, caplog.text)
+    assert_secret_free(GRANT_A.replace("-", "_"), caught.value, caplog.text)
+    await room.leave()
+    assert not room.adapter._session_manager.owns_resources()

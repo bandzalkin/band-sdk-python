@@ -434,27 +434,41 @@ class ClaudeSessionManager:
             startup.waiters += 1
             return startup
 
-        # Everything that can fail -- the room's workspace claim and the
-        # protected-server factory -- runs while the room's previous custody
-        # stays registered where it is.
+        # Everything that can fail or call out -- the reuse comparison, the
+        # room's workspace claim and the protected-server factory -- runs
+        # while the room's previous custody stays registered where it is.
+        protected: Any = None
         try:
             client = self._sessions.get(room_id)
-            if (
+            reusable = (
                 client is not None
                 and room_id not in self._unusable
                 and self._is_current(room_id, client)
-            ):
-                logger.debug("Reusing existing session for room: %s", room_id)
-                return client
-            if self._workspaces is not None:
-                self._workspaces.claim(room_id)
-            protected = self._protected_identity(room_id)
+            )
+            if not reusable:
+                if self._workspaces is not None:
+                    self._workspaces.claim(room_id)
+                protected = self._protected_identity(room_id)
         except Exception as error:
             if self._resolve_mcp_servers is None:
                 raise
             raise startup_error(
                 "reservation", "the room's session could not be reserved", error
             ) from None
+        # Those callbacks may have closed admission, retired the room or
+        # replaced its client: recheck, calling nothing, before acting.
+        if self._closing:
+            raise ClaudeSessionManagerStoppedError()
+        if room_id in self._retirements or room_id in self._startups:
+            return _RETRY
+        if self._sessions.get(room_id) is not client:
+            return _RETRY
+        if reusable:
+            assert client is not None
+            if room_id in self._unusable:
+                return _RETRY
+            logger.debug("Reusing existing session for room: %s", room_id)
+            return client
         if client is not None:
             logger.info("Replacing unusable or outdated session for room %s", room_id)
         if resume_session_id:
@@ -503,10 +517,32 @@ class ClaudeSessionManager:
     # -- startup worker (outside the queue) ----------------------------------
 
     def _require_live(self, startup: RoomStartup) -> None:
+        """Refuse a startup its room no longer wants. Any callback (the
+        protected-server factory) and comparison runs first; the final checks
+        call nothing, so nothing can retire the startup after they pass."""
+        replaced = self._protected_changed(startup)
+        self._require_admitted(startup)
+        if replaced:
+            # The Band server it would dial was replaced: never publish against
+            # the old endpoint; its waiters start again on the current one.
+            raise _StartupReplaced
+
+    def _protected_changed(self, startup: RoomStartup) -> bool:
+        try:
+            return bool(startup.protected != self._protected_identity(startup.room_id))
+        except Exception as error:  # noqa: BLE001 -- a callback; any failure is unsafe text
+            raise startup_error(
+                "reservation", "the room's protected servers could not be read", error
+            ) from None
+
+    def _require_admitted(self, startup: RoomStartup) -> None:
+        """Callback-free: the startup is still the room's, admitted, wanted and
+        not being cancelled."""
         worker = startup.worker
         if (
             startup.closing
             or self._closing
+            or startup.room_id in self._retirements
             or self._startups.get(startup.room_id) is not startup
             or startup.waiters <= 0
             # A cancellation of this very invocation is still outstanding,
@@ -514,10 +550,6 @@ class ClaudeSessionManager:
             or (worker is not None and worker.cancelling() > 0)
         ):
             raise _StartupRetired
-        if startup.protected != self._protected_identity(startup.room_id):
-            # The Band server it would dial was replaced: never publish against
-            # the old endpoint; its waiters start again on the current one.
-            raise _StartupReplaced
 
     async def _in_queue(self, call: Callable[[], Awaitable[Any]]) -> Any:
         """Run ``call`` on the manager's own task, where connect and disconnect
@@ -579,11 +611,19 @@ class ClaudeSessionManager:
     async def _do_launch(
         self, startup: RoomStartup, external: dict[str, Any] | None
     ) -> None:
-        """Create and connect the startup's client (in the queue)."""
+        """Create and connect the startup's client (in the queue).
+
+        Building the options runs callbacks (the permission factory, the
+        workspace resolver); the startup is rechecked, calling nothing, after
+        them and before any client is constructed."""
         self._require_live(startup)
         room_id = startup.room_id
         if external is None:
             options = self._build_options(room_id, startup.resume_session_id)
+            replaced = self._protected_changed(startup)
+            self._require_admitted(startup)
+            if replaced:
+                raise _StartupReplaced
             transport = create_transport(options)
             startup.transport = transport
             startup.client = ClaudeSDKClient(options=options, transport=transport)
@@ -603,10 +643,19 @@ class ClaudeSessionManager:
                     startup.resume_session_id,
                     mcp_servers=str(startup.config_file.path),
                 )
+            except Exception as error:  # noqa: BLE001 -- e.g. a permission factory; never a resume case
+                raise startup_error(
+                    "launch", "the Claude session could not be constructed", error
+                ) from None
+            replaced = self._protected_changed(startup)
+            self._require_admitted(startup)
+            if replaced:
+                raise _StartupReplaced
+            try:
                 transport = create_transport(options)
                 startup.transport = transport
                 startup.client = ClaudeSDKClient(options=options, transport=transport)
-            except Exception as error:  # noqa: BLE001 -- e.g. a permission factory; never a resume case
+            except Exception as error:  # noqa: BLE001 -- never a resume case
                 raise startup_error(
                     "launch", "the Claude session could not be constructed", error
                 ) from None
