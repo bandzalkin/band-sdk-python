@@ -690,6 +690,46 @@ class HeldServers:
         self.mcp_servers = servers
 
 
+class ClientCustody:
+    """What teardown must leave behind on an owned client: one disconnect, its
+    Query closed on both sides, and every reference dropped. A manager that
+    reports nothing held while the client it owned stays connected is the
+    failure this pins, so the checks read the client, not the manager."""
+
+    def __init__(self, client: ClaudeSDKClient) -> None:
+        self.client = client
+        self.query = client._query
+        self.disconnects = 0
+        self.calls: list[str] = []
+        assert self.query is not None, "the client was never connected"
+        query, real_disconnect = self.query, client.disconnect
+        real_close, real_close_receive = query.close, query.close_receive_stream
+
+        async def disconnect() -> None:
+            self.disconnects += 1
+            await real_disconnect()
+
+        async def close() -> None:
+            self.calls.append("close")
+            await real_close()
+
+        def close_receive() -> None:
+            self.calls.append("receive")
+            real_close_receive()
+
+        client.disconnect = disconnect  # type: ignore[method-assign]
+        query.close = close  # type: ignore[method-assign]
+        query.close_receive_stream = close_receive  # type: ignore[method-assign]
+
+    def assert_disconnected(self) -> None:
+        assert self.disconnects == 1, f"disconnect ran {self.disconnects} times"
+        assert self.calls == ["close", "receive"], self.calls
+        assert self.query._closed, "the client's Query stayed open"
+        assert self.client._query is None
+        assert self.client._transport is None
+        assert self.client._materialized is None
+
+
 @pytest.mark.parametrize("mode", ["materialized", "deferred"])
 async def test_the_reuse_decision_is_a_plain_bool_by_the_final_guard(
     tmp_path: Path,
@@ -713,6 +753,7 @@ async def test_the_reuse_decision_is_a_plain_bool_by_the_final_guard(
     )
     claude.mcp_statuses.append([{"name": BAND_MCP_SERVER_NAME, "status": "connected"}])
     client = await manager.get_or_create_session("room-a")
+    custody = ClientCustody(client)
     real_options = client.options
     probe = ReuseProbe(manager, mode)
     sessions_before = len(claude.sessions)
@@ -732,6 +773,7 @@ async def test_the_reuse_decision_is_a_plain_bool_by_the_final_guard(
     assert all(not s.alive for s in claude.sessions)
     assert len(claude.sessions) == sessions_before
     assert not manager.owns_resources()
+    custody.assert_disconnected()
 
 
 class RaisingTruth:
@@ -790,6 +832,7 @@ async def test_a_failing_reuse_decision_stays_a_safe_non_resume_failure(
     manager.get_or_create_session = counted  # type: ignore[method-assign]
     claude.mcp_statuses.append([{"name": BAND_MCP_SERVER_NAME, "status": "connected"}])
     client = await manager.get_or_create_session("room-a")
+    custody = ClientCustody(client)
     probe = RaisingTruth(secret)
     real_options = client.options
     real_identity = manager._identities.get("room-a")
@@ -817,3 +860,6 @@ async def test_a_failing_reuse_decision_stays_a_safe_non_resume_failure(
     assert secret not in str(error)
     assert secret not in caplog.text
     assert calls == ["hist-1"], "the room's session was started again without history"
+    assert all(not s.alive for s in claude.sessions)
+    assert not manager.owns_resources()
+    custody.assert_disconnected()
