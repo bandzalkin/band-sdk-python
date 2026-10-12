@@ -227,7 +227,11 @@ text/image tool results.
   so the deadline cannot cancel the turn's settlement again, and cancels the turn
   once, or joins a cancellation it is already handling. A turn whose deadline has
   fired, or that is already handling its own outcome, keeps its timeout or other
-  result and its failure report. A turn that has already finished is never
+  result and its failure report. A fired deadline counts as that cancellation even
+  if the resolver consumed it with `uncancel()`: cleanup joins it rather than
+  cancelling again, and a server set the resolver returns afterwards is refused, so
+  the turn ends with `TimeoutError` and nothing is launched. A turn that has already
+  finished is never
   cancelled, so its caller's later work is untouched. Retirement then waits for
   that call's own finalization (not for the rest of its caller's work), and only
   then closes the process and releases the workspace. A turn may request cleanup of

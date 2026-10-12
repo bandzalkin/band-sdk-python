@@ -185,7 +185,14 @@ class _ActiveTurn:
         self.baseline = self.task.cancelling()
 
     def cancel_requested(self) -> bool:
-        return self.task.cancelling() > self.baseline
+        """Whether this invocation is already being ended: a cancellation newer
+        than its baseline, or its own deadline having fired. The fired deadline
+        stays authoritative even after a callback consumed the request count with
+        ``uncancel()``, so takeover joins it and its resolver result is refused."""
+        timer = self.deadline
+        return self.task.cancelling() > self.baseline or (
+            timer is not None and timer.expired()
+        )
 
     def running(self) -> bool:
         """Neither settled nor already handling its own outcome."""

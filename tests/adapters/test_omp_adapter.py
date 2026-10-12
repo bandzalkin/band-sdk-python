@@ -1380,3 +1380,81 @@ async def test_self_cleanup_after_the_deadline_keeps_the_timeout_report(
         for failure in reported_failures(tools)
     ] == [("omp", "timeout")]
     assert launches.runtimes == []
+
+
+class UncancellingResolver(SettlingResolver):
+    """Consumes the deadline's cancellation with the public ``uncancel()``, then
+    settles; ``returns`` decides whether it re-raises or returns a server."""
+
+    def __init__(self, *, returns: bool) -> None:
+        super().__init__()
+        self.returns = returns
+
+    async def __call__(self, _workspace: str):
+        self.calls += 1
+        if self.calls > 1:
+            return {}
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            asyncio.current_task().uncancel()  # the request count is now consumed
+            self.cancellations += 1
+            self.cancel_seen.set()
+            try:
+                await self.settle.wait()
+            except asyncio.CancelledError:
+                self.cancellations += 1
+                raise
+            self.settled = True
+            if not self.returns:
+                raise
+        return {"linear": remote("late")}
+
+
+def timeout_reports(tools) -> list[tuple[str, str | None]]:
+    return [(f["provider"], f.get("code")) for f in reported_failures(tools)]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_joins_a_fired_deadline_whose_cancellation_was_consumed(
+    launches: Launches, tmp_path: Path
+):
+    resolver = UncancellingResolver(returns=False)
+    adapter, releases = settling_adapter(tmp_path, resolver, turn_timeout_s=0.05)
+    tools = FakeAgentTools()
+    first = asyncio.create_task(run_turn(adapter, tools))
+    await asyncio.wait_for(resolver.cancel_seen.wait(), 1)  # the deadline fired
+
+    cleanup = asyncio.create_task(adapter.on_cleanup("room-123"))
+
+    assert await not_done_within(cleanup)
+    assert resolver.cancellations == 1 and "room-123" in adapter._workspaces.rooms
+    resolver.settle.set()
+    await asyncio.wait_for(cleanup, 1)
+    with pytest.raises(TimeoutError):
+        await first
+    assert resolver.cancellations == 1 and releases and all(releases)
+    assert timeout_reports(tools) == [("omp", "timeout")]
+    assert launches.runtimes == []
+
+
+@pytest.mark.asyncio
+async def test_a_result_returned_after_the_deadline_fired_launches_nothing(
+    launches: Launches, tmp_path: Path
+):
+    resolver = UncancellingResolver(returns=True)
+    resolver.settle.set()  # settlement finishes and the resolver returns a server
+    adapter, releases = settling_adapter(tmp_path, resolver, turn_timeout_s=0.05)
+    tools = FakeAgentTools()
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(run_turn(adapter, tools), 1)
+
+    assert resolver.cancellations == 1 and resolver.settled
+    assert launches.runtimes == [] and launches.plugins == []
+    assert timeout_reports(tools) == [("omp", "timeout")]
+    assert not adapter._workspaces.rooms and releases and all(releases)
+    await run_turn(adapter, FakeAgentTools())  # explicit recovery
+    assert len(launches.runtimes) == 1
+    await adapter.cleanup_all()
