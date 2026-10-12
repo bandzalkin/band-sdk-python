@@ -667,7 +667,9 @@ class ReuseProbe:
 
     def _decide(self) -> bool:
         self.reads += 1
-        closing_now = self.reads == 1 if self.mode == "materialized" else self.reads >= 2
+        closing_now = (
+            self.reads == 1 if self.mode == "materialized" else self.reads >= 2
+        )
         if closing_now:
             self.manager.close_admission()
         return True
@@ -700,6 +702,7 @@ async def test_the_reuse_decision_is_a_plain_bool_by_the_final_guard(
     again: a callback that would close admission at the branch test cannot run
     there at all (the deferred case), and closing on the first read is refused
     outright (the control)."""
+
     def band(room_id: str) -> Any:
         return dict(BAND)
 
