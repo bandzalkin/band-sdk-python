@@ -201,6 +201,19 @@ text/image tool results.
   failed receipts fail startup rather than allowing a model to answer without its
   required tools. Native connection and tool failures remain errors, not successful
   Band replies. The enclosing turn timeout still bounds startup.
+- **Per-connection MCP servers.** Pass the constructor callable
+  `resolve_mcp_servers`, an async `(workspace: str) -> Mapping[str, OmpMcpServer]`,
+  when external servers (or their credentials) can change while the adapter runs.
+  It is called once for each new room process, with the room's claimed workspace,
+  before the overlay or process exists; the same result feeds both the overlay and
+  the startup receipt check. Its result is the room's complete external server set:
+  it replaces `mcp_servers`, an empty mapping means none, and an exception fails
+  that startup with no fallback to `mcp_servers`. A reused room process never calls
+  it again; a retired room (cancellation, failure, or cleanup) resolves afresh on its
+  next start. The name `band` is reserved, because OMP would mint that server's tools
+  under Band tool names. The callable is runtime-only and never part of
+  `OmpAdapterConfig`. Cleanup cancels a room that is still resolving, and a resolver
+  that returns after its room was cancelled cannot launch it.
 - **Permissions.** `approval_mode="yolo"` bypasses native approval checks without
   changing Band platform permissions. Otherwise `resolve_permission` receives
   `OmpPermissionRequest(room_id, session_id, title, options)` and returns an

@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import ClassVar, Literal, Self, cast
 from uuid import uuid4
 
@@ -79,6 +80,7 @@ from band.runtime.prompts import (
     render_system_prompt,
 )
 from band.runtime.tools import (
+    BAND_MCP_SERVER_NAME,
     get_band_tool_category,
     get_tool_description,
     is_image_passthrough_result,
@@ -132,6 +134,7 @@ class OmpPermissionRequest(BaseModel):
 
 
 PermissionResolver = Callable[[OmpPermissionRequest], Awaitable[str | None]]
+McpServerResolver = Callable[[str], Awaitable[Mapping[str, OmpMcpServer]]]
 
 
 class _ThinkingLevels(BaseModel):
@@ -180,6 +183,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         additional_tools: list[CustomToolDef] | None = None,
         workspace_for_room: WorkspaceResolver | None = None,
         resolve_permission: PermissionResolver | None = None,
+        resolve_mcp_servers: McpServerResolver | None = None,
         **features: Unpack[FeatureKwargs],
     ) -> None:
         super().__init__(history_converter=OmpHistoryConverter(), **features)
@@ -193,6 +197,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         self._locks: dict[str, asyncio.Lock] = {}
         self._owners: dict[str, asyncio.Task[object]] = {}
         self._room_selections: dict[str, ModelSelection] = {}
+        self._resolve_mcp_servers = resolve_mcp_servers
         self._host_schemas = self._build_host_tools()
 
     def apply_effective_features(self, features: AdapterFeatures) -> None:
@@ -261,13 +266,41 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         )
         return omp_command_in_workspace(command, workspace) if workspace else command
 
+    async def _connection_mcp_servers(
+        self, workspace: str
+    ) -> Mapping[str, OmpMcpServer]:
+        """The external MCP servers for one new native connection.
+
+        Without a resolver this is the static config. With one, its result is the
+        complete external set for this connection, used for both the overlay and
+        native readiness; a failure propagates rather than falling back to config.
+        """
+        if self._resolve_mcp_servers is None:
+            return self.config.mcp_servers
+        servers = dict(await self._resolve_mcp_servers(workspace))
+        owner = asyncio.current_task()
+        if owner is not None and owner.cancelling():
+            # The resolver settled its own work instead of re-raising; the room
+            # was still cancelled, so nothing may be launched from its result.
+            raise asyncio.CancelledError
+        for name, server in servers.items():
+            if not isinstance(name, str) or not isinstance(server, OmpMcpServer):
+                raise TypeError("resolve_mcp_servers must map names to OmpMcpServer")
+            if name == BAND_MCP_SERVER_NAME:
+                # OMP mints this server's tools under Band's own tool names.
+                raise ValueError(
+                    f"MCP server name {BAND_MCP_SERVER_NAME!r} is reserved for Band tools"
+                )
+        return MappingProxyType(servers)
+
     async def _open_room(self, room_id: str, history: OmpSessionState) -> OmpRoom:
         workspace = self._workspaces.claim(room_id)
         resources = ExitStack()
         try:
+            servers = await self._connection_mcp_servers(workspace)
             plugin = resources.enter_context(
                 omp_mcp_plugin(
-                    self.config.mcp_servers,
+                    servers,
                     workspace=workspace,
                     system_prompt=self._build_system_context(),
                 )
@@ -284,7 +317,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
             self._rooms[room_id] = room
             await room.runtime.start()
             if plugin:
-                await omp_mcp_ready(room.runtime, plugin, self.config.mcp_servers)
+                await omp_mcp_ready(room.runtime, plugin, servers)
             candidate = history.room_to_session.get(room_id)
             if (
                 candidate
@@ -688,9 +721,15 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         self._room_selections.pop(room_id, None)
 
     async def cleanup_all(self) -> None:
-        await asyncio.gather(
-            *(self.on_cleanup(room_id) for room_id in tuple(self._rooms))
-        )
+        # A room still resolving its MCP servers has an owner but no process yet;
+        # cancelling that owner is what keeps it from launching after shutdown.
+        rooms = dict.fromkeys((*self._rooms, *self._owners))
+        await asyncio.gather(*(self.on_cleanup(room_id) for room_id in rooms))
 
 
-__all__ = ["OmpAdapter", "OmpAdapterConfig", "OmpPermissionRequest"]
+__all__ = [
+    "McpServerResolver",
+    "OmpAdapter",
+    "OmpAdapterConfig",
+    "OmpPermissionRequest",
+]
