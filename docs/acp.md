@@ -112,7 +112,8 @@ migrate before upgrading. TypeScript parity is a separate change.
   exactly one room.
 - A room keeps its runtime and workspace claim until its agent process is confirmed
   exited: a rejoining room waits for the old process, and one that cannot be reaped is
-  kept (the cleanup raises) and retried by the room's next turn or cleanup. A setup a
+  kept (the cleanup raises) only to be retried by the room's next turn or cleanup; it
+  serves no turn, not even one already under way. A setup a
   cleanup or a leaving turn gave up on also holds the room until it settles, and is
   cancelled at most once: a setup already being cancelled is waited for, not cancelled
   again.

@@ -1152,14 +1152,20 @@ async def test_a_setup_requesting_teardown_does_not_wait_on_itself(
             terminate_setups(adapter)
             raise
 
-        # The request returned while the setup is unsettled: everything the
-        # teardown must release is still held.
-        assert log == ["request returned"]
-        assert DEFAULT_ROOM in adapter._runtimes
-        assert DEFAULT_ROOM in adapter._workspaces.rooms
-        assert adapter._mcp.current is not None
+        owned = [turn] if outside is None else [turn, outside]
+        try:
+            # The request returned while the setup is unsettled: everything
+            # the teardown must release is still held.
+            assert log == ["request returned"]
+            assert DEFAULT_ROOM in adapter._runtimes
+            assert DEFAULT_ROOM in adapter._workspaces.rooms
+            assert adapter._mcp.current is not None
+        finally:
+            # Released and drained even when an assertion above failed, so
+            # the fixture's teardown is never stranded behind held work.
+            callback.settle.set()
+            await asyncio.gather(*owned, return_exceptions=True)
 
-        callback.settle.set()
         with pytest.raises(asyncio.CancelledError):
             await turn
         if outside is not None:
@@ -1229,5 +1235,73 @@ async def test_a_final_request_after_shutdown_finished_runs_fresh_final_work() -
 
         await adapter.on_started("Fake Agent", "restarted")
         reply = await acp.send("after restart", room="room-2")
+
+    assert reply.thoughts == ["ok"]
+
+
+class CountingResolver(Resolver):
+    @property
+    def calls(self) -> int:
+        return len(self.workspaces)
+
+
+async def test_a_runtime_kept_for_close_retry_serves_no_captured_turn() -> None:
+    agent = FakeACPAgent(http=True).will_say("ok")
+    resolver = CountingResolver(http_server())
+    sleeper = await spawn_sleeper()
+    failing_wait_once(sleeper)
+
+    async with acp_adapter(
+        agent, fake_agent_config(), resolve_mcp_servers=resolver
+    ) as acp:
+        adapter = acp.adapter
+        await acp.send("before")
+        captured = adapter._runtimes[DEFAULT_ROOM]
+        captured._process = sleeper
+        sessions = len(agent.sessions)
+
+        with pytest.raises(ACPProcessCloseError):
+            await adapter.cleanup_all(final=False)
+        assert captured.closed and captured.close_pending
+
+        # A continuation that took the runtime before the failed cleanup.
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._get_or_create_session(captured, DEFAULT_ROOM, None)
+
+        assert resolver.calls == 1
+        assert len(agent.sessions) == sessions
+        # Still owned, for the close retry.
+        assert adapter._runtimes[DEFAULT_ROOM] is captured
+        assert DEFAULT_ROOM in adapter._workspaces.rooms
+        assert captured._process is sleeper
+
+        await adapter.cleanup_all(final=False)
+        assert sleeper.returncode is not None
+        reply = await acp.send("after")
+
+    assert reply.thoughts == ["ok"]
+    assert resolver.calls == 2
+
+
+async def test_a_stale_turn_after_restartable_cleanup_starts_no_band_server() -> None:
+    agent = FakeACPAgent(http=True).will_say("ok")
+
+    async with acp_adapter(agent, fake_agent_config(inject_band_tools=True)) as acp:
+        adapter = acp.adapter
+        await acp.send("before")
+        stale = adapter._runtimes[DEFAULT_ROOM]
+        sessions = len(agent.sessions)
+        await adapter.cleanup_all(final=False)
+        assert adapter._mcp.current is None
+
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._get_or_create_session(stale, DEFAULT_ROOM, None)
+
+        # Not final, so nothing but the fence kept the server down.
+        assert adapter._mcp.current is None
+        assert len(agent.sessions) == sessions
+
+        reply = await acp.send("after")
+        assert adapter._mcp.current is not None
 
     assert reply.thoughts == ["ok"]

@@ -1257,10 +1257,14 @@ class ACPClientAdapter(
             await self._release_session_initializer(room_id, initializer)
 
     def _require_current_runtime(self, runtime: ACPRuntime, room_id: str) -> None:
-        """Refuse a turn whose runtime is no longer the room's, whose room is
-        retiring, or whose adapter is shutting down."""
+        """Refuse a turn whose runtime is no longer the room's or unusable
+        (closed, or kept only to retry confirming its process closed), whose
+        room is retiring, or whose adapter is shutting down. Refusal leaves a
+        kept runtime owned for that retry."""
         if (
             self._runtimes.get(room_id) is not runtime
+            or runtime.closed
+            or runtime.close_pending
             or room_id in self._retirements
             or self._shut_down
             or self._active_shutdown() is not None
