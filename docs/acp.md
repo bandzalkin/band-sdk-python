@@ -12,7 +12,7 @@ safety qualification; see [idle room resource retention](idle-room-release.md).
 `ACPClientAdapterConfig` holds the plain settings; `CursorACPAdapterConfig`,
 `CopilotACPAdapterConfig` and `OmpACPAdapterConfig` extend it with backend defaults
 and fields. Callables (`workspace_for_room`, `resolve_session_config`,
-`resolve_permission`) are keyword-only constructor arguments.
+`resolve_permission`, `resolve_mcp_servers`) are keyword-only constructor arguments.
 
 ```python
 from band.adapters import ACPClientAdapter, ACPClientAdapterConfig
@@ -110,6 +110,27 @@ migrate before upgrading. TypeScript parity is a separate change.
   the agent's own sandbox when that boundary matters.
 - TCP and custom transports are rejected: one remote process cannot be proven to serve
   exactly one room.
+- A room keeps its runtime and workspace claim until its agent process is confirmed
+  exited: a rejoining room waits for the old process, and one that cannot be reaped is
+  kept (the cleanup raises) and retried by the room's next turn or cleanup.
+
+## Per-room MCP servers
+
+`resolve_mcp_servers(workspace)` (on `ACPClientAdapter` and `CopilotACPAdapter`) returns
+native `acp.schema` descriptors for a room's workspace. It runs once per session setup,
+after the agent initializes; a reused session keeps its servers, and a restore and its
+fresh-session fallback get the same snapshot. Its result replaces `config.mcp_servers`
+(an empty result leaves none; a failure never falls back to them), except Band's
+routing: a configured `band` entry and the injected Band server follow it unchanged.
+
+- `McpServerStdio` is always accepted; `HttpMcpServer` and `SseMcpServer` only when the
+  agent explicitly advertises that transport in `initialize`. `AcpMcpServer` is refused.
+- Names must be unique and may not be `band`.
+- A refused server fails the turn with `ACPMcpServerResolutionError`, which names the
+  server and transport but never its URL, headers, command or environment. Any failure,
+  including one raised by the callback, retires the room's runtime; the next turn starts
+  fresh.
+- There is no timeout: a callback that never returns holds that room's setup.
 
 ## Session config
 
