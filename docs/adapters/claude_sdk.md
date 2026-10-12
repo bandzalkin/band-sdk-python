@@ -110,10 +110,13 @@ reuse the failed client or take another room's claimed directory.
 - **Teardown keeps what it can't release.** `cleanup_all()` refuses new turns
   and session startups as soon as it is called, and keeps refusing them until a
   successful `on_started`. A CLI whose exit can't be confirmed within 5 seconds of
-  being killed, or a private file that can't be removed, is kept with its
-  workspace claim and the Band server it may dial, and the cleanup raises a safe
-  error; calling it again (or `on_started`) retries. Concurrent `cleanup_all()`
-  calls share one teardown that a cancelled caller can't abandon.
+  being killed, or a private file that can't be removed (including one only
+  partly written), is kept with its workspace claim and the Band server it may
+  dial, and the cleanup raises a safe error; calling it again (or `on_started`)
+  retries. While a room still holds such a CLI or file, its next turn first
+  retries removing it and starts no new connection until that succeeds.
+  Concurrent `cleanup_all()` calls share one teardown that a cancelled caller
+  can't abandon.
 
 ```python
 import pytest

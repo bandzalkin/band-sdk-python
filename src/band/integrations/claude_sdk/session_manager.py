@@ -440,8 +440,11 @@ class ClaudeSessionManager:
                 logger.debug("Reusing existing session for room: %s", room_id)
                 return client
             logger.info("Replacing unusable or outdated session for room %s", room_id)
-            # The replacement owns the old client from here: its worker closes
-            # it through the queue before launching, so nothing here awaits.
+        if client is not None or room_id in self._config_files:
+            # The replacement owns whatever the room still holds -- a client, or
+            # only a file an earlier cleanup could not remove: its worker closes
+            # it through the queue, and must succeed, before resolving or
+            # allocating anything new. Nothing here awaits.
             stale = self._take_session(room_id)
 
         if resume_session_id:
@@ -518,6 +521,7 @@ class ClaudeSessionManager:
         try:
             if (
                 startup.stale_client is not None
+                or startup.stale_transport is not None
                 or startup.stale_config_file is not None
             ):
                 await self._in_queue(lambda: self._do_close_stale(startup))
@@ -563,23 +567,34 @@ class ClaudeSessionManager:
         """Create and connect the startup's client (in the queue)."""
         self._require_live(startup)
         room_id = startup.room_id
-        mcp_servers: Any = None
-        if external is not None:
+        if external is None:
+            options = self._build_options(room_id, startup.resume_session_id)
+            transport = create_transport(options)
+            startup.transport = transport
+            startup.client = ClaudeSDKClient(options=options, transport=transport)
+        else:
             try:
-                startup.config_file = McpConfigFile.create(
-                    {**external, **(startup.protected or {})}
-                )
+                # Owned from allocation, before anything that can fail writes
+                # to it: the discard path removes it or keeps it for retry.
+                startup.config_file = McpConfigFile.allocate()
+                startup.config_file.write({**external, **(startup.protected or {})})
             except Exception as error:  # noqa: BLE001 -- a safe error, whatever failed
                 raise startup_error(
                     "launch", "the private MCP file could not be written", error
                 ) from None
-            mcp_servers = str(startup.config_file.path)
-        options = self._build_options(
-            room_id, startup.resume_session_id, mcp_servers=mcp_servers
-        )
-        transport = create_transport(options)
-        startup.transport = transport
-        startup.client = ClaudeSDKClient(options=options, transport=transport)
+            try:
+                options = self._build_options(
+                    room_id,
+                    startup.resume_session_id,
+                    mcp_servers=str(startup.config_file.path),
+                )
+                transport = create_transport(options)
+                startup.transport = transport
+                startup.client = ClaudeSDKClient(options=options, transport=transport)
+            except Exception as error:  # noqa: BLE001 -- e.g. a permission factory; never a resume case
+                raise startup_error(
+                    "launch", "the Claude session could not be constructed", error
+                ) from None
         try:
             await startup.client.connect()
         except Exception as error:
@@ -598,6 +613,13 @@ class ClaudeSessionManager:
     def _publish(self, startup: RoomStartup) -> None:
         room_id = startup.room_id
         assert startup.client is not None and startup.transport is not None
+        if (
+            room_id in self._sessions
+            or room_id in self._transports
+            or room_id in self._config_files
+        ):
+            # Never overwrite an unresolved obligation of the room's.
+            raise _StartupRetired
         del self._startups[room_id]
         self._sessions[room_id] = startup.client
         self._transports[room_id] = startup.transport

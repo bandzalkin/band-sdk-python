@@ -18,14 +18,24 @@ import tempfile
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, ForwardRef, TypeAlias
 
 if TYPE_CHECKING:
     from claude_agent_sdk.types import McpServerConfig
 
-McpServerResolver: TypeAlias = (
-    "Callable[[str], Awaitable[Mapping[str, McpServerConfig]]]"
-)
+    McpServerResolver: TypeAlias = Callable[
+        [str], Awaitable[Mapping[str, McpServerConfig]]
+    ]
+else:
+    # A real alias, so annotations such as ``McpServerResolver | None``
+    # evaluate at runtime; the native config type is named by reference and
+    # resolved from the SDK only when introspected, keeping the SDK optional.
+    McpServerResolver = Callable[
+        [str],
+        Awaitable[
+            Mapping[str, ForwardRef("McpServerConfig", module="claude_agent_sdk.types")]
+        ],
+    ]
 """``resolve_mcp_servers(workspace)``: the complete external MCP servers for a
 new Claude connection in ``workspace``, as native ``McpServerConfig`` values."""
 
@@ -95,42 +105,73 @@ def is_safe_startup_error(error: BaseException) -> bool:
     return isinstance(error, _OwnedStartupError)
 
 
+_NOT_A_MAPPING = object()
+
+
 def freeze_external_servers(
     resolved: object, protected: Mapping[str, Any]
 ) -> dict[str, dict[str, Any]]:
     """An owned deep copy of the callback's servers, validated for the native CLI.
 
     Later changes to the mappings, lists or headers the callback returned can't
-    reach the launch. In-process ``sdk`` servers and names Band reserves are
-    refused by name. Anything the callback's objects raise while being read
-    becomes a safe error.
+    reach the launch. Reading the callback's objects runs their code, so every
+    exception raised while copying them -- whatever its type -- is replaced by
+    a safe error; only the plain copy is then validated, and in-process ``sdk``
+    servers and names Band reserves are refused by name.
     """
+    return _validate(_copy_servers(resolved), protected)
+
+
+def _copy_servers(resolved: object) -> dict[str, object]:
+    """Plain JSON values copied out of the callback's result. No callback code
+    runs after this returns."""
     try:
-        return _freeze(resolved, protected)
-    except _OwnedStartupError:
-        raise
-    except Exception as error:  # noqa: BLE001 -- the callback's objects may raise anything
+        if not isinstance(resolved, Mapping):
+            pairs = None
+        else:
+            pairs = list(resolved.items())
+    except Exception as error:  # noqa: BLE001 -- untrusted, whatever its type
         raise startup_error(
             "resolution", "the resolved servers could not be read", error
         ) from None
-
-
-def _freeze(
-    resolved: object, protected: Mapping[str, Any]
-) -> dict[str, dict[str, Any]]:
-    if not isinstance(resolved, Mapping):
+    if pairs is None:
         raise startup_error(
             "resolution", "resolve_mcp_servers must return a mapping of servers"
         )
-    frozen: dict[str, dict[str, Any]] = {}
-    for name, config in resolved.items():
-        if not isinstance(name, str) or not name:
+    copied: dict[str, object] = {}
+    for name, config in pairs:
+        # Exactly ``str``: a subclass could render itself however it likes.
+        if type(name) is not str or not name:
             raise startup_error("resolution", "server names must be strings")
+        try:
+            if not isinstance(config, Mapping):
+                copied[name] = _NOT_A_MAPPING
+                continue
+            copied[name] = json.loads(json.dumps(dict(config)))
+        except (TypeError, ValueError) as error:
+            raise startup_error(
+                "resolution", "server config is not serializable", error, server=name
+            ) from None
+        except Exception as error:  # noqa: BLE001 -- untrusted, whatever its type
+            raise startup_error(
+                "resolution",
+                "the resolved servers could not be read",
+                error,
+                server=name,
+            ) from None
+    return copied
+
+
+def _validate(
+    copied: dict[str, object], protected: Mapping[str, Any]
+) -> dict[str, dict[str, Any]]:
+    frozen: dict[str, dict[str, Any]] = {}
+    for name, config in copied.items():
         if name in protected:
             raise startup_error(
                 "resolution", "the name is reserved for Band", server=name
             )
-        if not isinstance(config, Mapping):
+        if not isinstance(config, dict):
             raise startup_error(
                 "resolution", "server config must be a mapping", server=name
             )
@@ -146,12 +187,7 @@ def _freeze(
             raise startup_error(
                 "resolution", f"server config needs a string {required}", server=name
             )
-        try:
-            frozen[name] = json.loads(json.dumps(dict(config)))
-        except (TypeError, ValueError) as error:
-            raise startup_error(
-                "resolution", "server config is not serializable", error, server=name
-            ) from None
+        frozen[name] = config
     return frozen
 
 
@@ -159,26 +195,25 @@ def _freeze(
 class McpConfigFile:
     """The private native ``--mcp-config`` file one connection launches with.
 
-    Owned until its child's exit is confirmed; then ``release`` removes it. A
-    release that fails raises and leaves it owned, for a later retry.
+    ``allocate`` creates only its private directory, so the caller owns it
+    before anything can fail; ``write`` then fills it. Owned until its child's
+    exit is confirmed; then ``release`` removes it. A release that fails raises
+    and leaves it owned, for a later retry.
     """
 
     directory: Path
     path: Path
 
     @classmethod
-    def create(cls, servers: Mapping[str, Any]) -> McpConfigFile:
+    def allocate(cls) -> McpConfigFile:
         directory = Path(tempfile.mkdtemp(prefix="band-claude-mcp-"))
-        os.chmod(directory, 0o700)
-        path = directory / "mcp.json"
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump({"mcpServers": dict(servers)}, handle)
-        except BaseException:
-            shutil.rmtree(directory, ignore_errors=True)
-            raise
-        return cls(directory=directory, path=path)
+        return cls(directory=directory, path=directory / "mcp.json")
+
+    def write(self, servers: Mapping[str, Any]) -> None:
+        os.chmod(self.directory, 0o700)
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"mcpServers": dict(servers)}, handle)
 
     def release(self) -> None:
         try:

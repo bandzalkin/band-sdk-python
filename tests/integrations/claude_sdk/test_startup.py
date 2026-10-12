@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -82,12 +83,17 @@ async def started(
     owned = transport.ConfirmedCloseTransport(native)
     await owned.connect()
     child = native._child
+    # The test may patch the child's own kill/wait to fail or block; reap with
+    # the class's unpatched operations, and within a bound.
+    kill, wait = type(child).kill, type(child).wait
     try:
         yield owned, native
     finally:
         if child.returncode is None:
-            child.kill()
-            await child.wait()
+            with contextlib.suppress(ProcessLookupError):
+                kill(child)
+            async with asyncio.timeout(10):
+                await wait(child)
 
 
 async def test_a_close_that_falsely_succeeds_still_reaps_the_child(
