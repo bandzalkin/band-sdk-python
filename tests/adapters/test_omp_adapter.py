@@ -887,9 +887,11 @@ class SettlingResolver:
         return {}
 
 
-def settling_adapter(tmp_path: Path, resolver: SettlingResolver):
+def settling_adapter(tmp_path: Path, resolver, **config):
     adapter = OmpAdapter(
-        OmpAdapterConfig(cwd=str(tmp_path)), resolve_mcp_servers=resolver, emit=()
+        OmpAdapterConfig(cwd=str(tmp_path), **config),
+        resolve_mcp_servers=resolver,
+        emit=(),
     )
     releases: list[bool] = []  # whether settlement had finished at each release
     real_release = adapter._workspaces.release
@@ -1014,3 +1016,133 @@ async def test_cleanup_all_joins_a_retirement_blocked_in_native_close(
     await run_turn(adapter, FakeAgentTools())
     assert len(launches.runtimes) == 2
     await adapter.cleanup_all()
+
+
+async def not_done_within(task: asyncio.Task, seconds: float = 0.1) -> bool:
+    done, _ = await asyncio.wait({task}, timeout=seconds)
+    return not done
+
+
+@pytest.mark.asyncio
+async def test_cleanup_joins_a_turn_already_settling_an_external_cancellation(
+    launches: Launches, tmp_path: Path
+):
+    resolver = SettlingResolver()
+    adapter, releases = settling_adapter(tmp_path, resolver)
+    first = await start_blocked_turn(adapter, resolver)
+    first.cancel()
+    await asyncio.wait_for(resolver.cancel_seen.wait(), 1)
+
+    cleanup = asyncio.create_task(adapter.on_cleanup("room-123"))
+
+    assert await not_done_within(cleanup)
+    assert resolver.cancellations == 1 and "room-123" in adapter._workspaces.rooms
+    resolver.settle.set()
+    await asyncio.wait_for(cleanup, 1)
+    assert resolver.cancellations == 1 and releases and all(releases)
+    assert first.cancelled() and launches.runtimes == []
+    await run_turn(adapter, FakeAgentTools())  # explicit recovery
+    assert len(launches.runtimes) == 1
+    await adapter.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_during_a_deadline_settlement_keeps_the_timeout_report(
+    launches: Launches, tmp_path: Path
+):
+    resolver = SettlingResolver()
+    adapter, releases = settling_adapter(tmp_path, resolver, turn_timeout_s=0.05)
+    tools = FakeAgentTools()
+    first = asyncio.create_task(run_turn(adapter, tools))
+    await asyncio.wait_for(resolver.cancel_seen.wait(), 1)  # the deadline fired
+
+    cleanup = asyncio.create_task(adapter.on_cleanup("room-123"))
+
+    assert await not_done_within(cleanup)
+    resolver.settle.set()
+    await asyncio.wait_for(cleanup, 1)
+    with pytest.raises(TimeoutError):
+        await first
+    assert resolver.cancellations == 1 and releases and all(releases)
+    assert [
+        (failure["provider"], failure.get("code"))
+        for failure in reported_failures(tools)
+    ] == [("omp", "timeout")]
+    assert launches.runtimes == []
+
+
+@pytest.mark.asyncio
+async def test_cleanup_requested_by_the_resolving_turn_launches_nothing(
+    launches: Launches, tmp_path: Path
+):
+    adapter: OmpAdapter
+
+    async def resolve(_workspace: str):
+        if not launches.runtimes and resolve.calls == 0:
+            resolve.calls += 1
+            await adapter.on_cleanup("room-123")  # the room's own turn retires it
+        return {"linear": remote("late")}
+
+    resolve.calls = 0  # type: ignore[attr-defined]
+    adapter = OmpAdapter(
+        OmpAdapterConfig(cwd=str(tmp_path)), resolve_mcp_servers=resolve, emit=()
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(run_turn(adapter, FakeAgentTools()), 1)
+    await asyncio.wait_for(adapter.cleanup_all(), 1)
+
+    assert launches.runtimes == [] and not adapter._workspaces.rooms
+    await run_turn(adapter, FakeAgentTools())  # explicit recovery
+    assert len(launches.runtimes) == 1
+    await adapter.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_retirement_waits_for_the_turn_not_for_its_callers_other_work(
+    launches: Launches, tmp_path: Path
+):
+    resolver = SettlingResolver()
+    resolver.settle.set()  # cancellation settles immediately
+    adapter, releases = settling_adapter(tmp_path, resolver)
+    turn_returned = asyncio.Event()
+
+    async def caller():
+        try:
+            await run_turn(adapter, FakeAgentTools())
+        except asyncio.CancelledError:
+            turn_returned.set()
+        await asyncio.Event().wait()  # unrelated work keeps the caller alive
+
+    wrapper = asyncio.create_task(caller())
+    await asyncio.wait_for(resolver.entered.wait(), 1)
+
+    await asyncio.wait_for(adapter.on_cleanup("room-123"), 1)
+
+    assert turn_returned.is_set() and not wrapper.done()
+    assert resolver.cancellations == 1 and releases and all(releases)
+    assert not adapter._workspaces.rooms and launches.runtimes == []
+    wrapper.cancel()
+    await run_turn(adapter, FakeAgentTools())  # explicit recovery
+    assert len(launches.runtimes) == 1
+    await adapter.cleanup_all()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_all_joins_a_retirement_with_no_room_or_turn_left(
+    launches: Launches, tmp_path: Path
+):
+    adapter = OmpAdapter(OmpAdapterConfig(cwd=str(tmp_path)), emit=())
+    room_lock = asyncio.Lock()
+    adapter._locks["room-123"] = room_lock
+    await room_lock.acquire()  # another holder keeps the retirement from closing
+    retirement = asyncio.create_task(adapter.on_cleanup("room-123"))
+    await asyncio.sleep(0)  # the retirement now exists; nothing else names the room
+    assert not adapter._rooms and not adapter._owners
+
+    shutdown = asyncio.create_task(adapter.cleanup_all())
+
+    assert await not_done_within(shutdown)  # it joined the in-flight retirement
+    room_lock.release()
+    await asyncio.wait_for(asyncio.gather(retirement, shutdown), 1)
+    assert launches.runtimes == []

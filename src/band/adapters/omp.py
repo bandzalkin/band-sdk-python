@@ -163,6 +163,35 @@ class OmpTurn:
     closing_text: list[str] = field(default_factory=list)
 
 
+@dataclass
+class _ActiveTurn:
+    """One ``on_message`` invocation that owns its room.
+
+    ``task`` is what retirement cancels; ``settled`` is set by the invocation's own
+    finalization, so retirement never waits on the rest of its caller's lifetime.
+    """
+
+    task: asyncio.Task[object]
+    settled: asyncio.Event = field(default_factory=asyncio.Event)
+    retired: bool = False  # retirement claimed the room; nothing may launch now
+    ending: bool = False  # already handling its outcome; must not be interrupted
+    # A caller task may carry cancellations it handled earlier; only newer ones
+    # belong to this invocation.
+    baseline: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.baseline = self.task.cancelling()
+
+    def cancel_requested(self) -> bool:
+        return self.task.cancelling() > self.baseline
+
+    def interruptible(self) -> bool:
+        """Whether cancelling now would start, not interrupt, its settlement:
+        a turn already handling a cancellation, its deadline, or its outcome is
+        joined instead."""
+        return not self.ending and not self.cancel_requested()
+
+
 class OmpAdapter(SimpleAdapter[OmpSessionState]):
     """Keep Band's turn owned until OMP reports native session settlement.
 
@@ -196,7 +225,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         )
         self._rooms: dict[str, OmpRoom] = {}
         self._locks: dict[str, asyncio.Lock] = {}
-        self._owners: dict[str, asyncio.Task[object]] = {}
+        self._owners: dict[str, _ActiveTurn] = {}
         self._room_selections: dict[str, ModelSelection] = {}
         self._retirements: dict[str, int] = {}
         self._retiring: dict[str, asyncio.Task[None]] = {}
@@ -270,7 +299,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         return omp_command_in_workspace(command, workspace) if workspace else command
 
     async def _connection_mcp_servers(
-        self, workspace: str
+        self, room_id: str, workspace: str
     ) -> Mapping[str, OmpMcpServer]:
         """The external MCP servers for one new native connection.
 
@@ -281,10 +310,10 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         if self._resolve_mcp_servers is None:
             return self.config.mcp_servers
         servers = dict(await self._resolve_mcp_servers(workspace))
-        owner = asyncio.current_task()
-        if owner is not None and owner.cancelling():
-            # The resolver settled its own work instead of re-raising; the room
-            # was still cancelled, so nothing may be launched from its result.
+        active = self._owners.get(room_id)
+        if active is not None and (active.retired or active.cancel_requested()):
+            # Retirement or cancellation arrived while the resolver ran and the
+            # resolver returned anyway; nothing may be launched from its result.
             raise asyncio.CancelledError
         for name, server in servers.items():
             if not isinstance(name, str) or not isinstance(server, OmpMcpServer):
@@ -305,7 +334,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         workspace = self._workspaces.claim(room_id)
         resources = ExitStack()
         try:
-            servers = await self._connection_mcp_servers(workspace)
+            servers = await self._connection_mcp_servers(room_id, workspace)
             plugin = resources.enter_context(
                 omp_mcp_plugin(
                     servers,
@@ -486,9 +515,10 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
             ):
                 # The room was retired, or is being retired, while this turn waited.
                 raise asyncio.CancelledError
-            owner = asyncio.current_task()
-            if owner is not None:
-                self._owners[room_id] = owner
+            task = asyncio.current_task()
+            assert task is not None, "OMP turns run inside an asyncio task"
+            active = _ActiveTurn(task)
+            self._owners[room_id] = active
             deadline = asyncio.timeout(self.config.turn_timeout_s)
             try:
                 async with deadline:
@@ -544,12 +574,15 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                         },
                     )
             except asyncio.CancelledError:
+                active.ending = True
                 await self._retire_after_failure(room_id)
                 raise
             except DeliveryFailedError as error:
+                active.ending = True
                 await self._retire_after_failure(room_id)
                 reraise_delivery_cause(error)
             except Exception:
+                active.ending = True
                 await self._retire_after_failure(room_id)
                 logger.exception("OMP turn failed in room %s", room_id)
                 failure = (
@@ -564,7 +597,9 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                 await tools.send_failure(failure)
                 raise
             finally:
-                self._owners.pop(room_id, None)
+                if self._owners.get(room_id) is active:
+                    del self._owners[room_id]
+                active.settled.set()
 
     async def _execute_tool(
         self, call: OmpHostToolCall, tools: AgentToolsProtocol
@@ -749,18 +784,24 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         operation = self._retiring.get(room_id)
         if operation is None:
             operation = self._begin_retirement(room_id)
-        if self._owners.get(room_id) is asyncio.current_task():
-            # The room's own turn cannot wait for a retirement that waits for it;
-            # teardown follows as soon as that turn ends.
+        active = self._owners.get(room_id)
+        if active is not None and active.task is asyncio.current_task():
+            # The room's own turn cannot wait for a retirement that waits for it.
+            # It is already marked retired, so it stops before launching anything,
+            # and teardown follows its settlement.
             return
         await asyncio.shield(operation)
 
     def _begin_retirement(self, room_id: str) -> asyncio.Task[None]:
         # Everything here is synchronous, so admission closes before any turn can
-        # run: queued turns see the new generation, arriving ones the retirement.
+        # run: queued turns see the new generation, arriving ones the retirement,
+        # and the active turn can no longer launch from whatever it resolves.
         self._retirements[room_id] = self._retirements.get(room_id, 0) + 1
+        active = self._owners.get(room_id)
+        if active is not None:
+            active.retired = True
         operation = asyncio.create_task(
-            self._retire(room_id, self._owners.get(room_id), asyncio.current_task())
+            self._retire(room_id, active, asyncio.current_task())
         )
         self._retiring[room_id] = operation
         operation.add_done_callback(lambda task: self._end_retirement(room_id, task))
@@ -775,13 +816,14 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
     async def _retire(
         self,
         room_id: str,
-        owner: asyncio.Task[object] | None,
+        active: _ActiveTurn | None,
         requester: asyncio.Task[object] | None,
     ) -> None:
-        if owner is not None:
-            if owner is not requester:
-                owner.cancel()  # once; every later cleanup joins this retirement
-            await asyncio.wait({owner})  # its cancellation handling settles fully
+        if active is not None:
+            if active.task is not requester and active.interruptible():
+                active.task.cancel()  # once; every later cleanup joins this retirement
+            # The invocation's own finalization, not its caller's whole lifetime.
+            await active.settled.wait()
         async with self._locks.setdefault(room_id, asyncio.Lock()):
             await self._close_room(room_id)
         self._room_selections.pop(room_id, None)
