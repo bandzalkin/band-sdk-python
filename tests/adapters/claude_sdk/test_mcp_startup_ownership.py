@@ -651,28 +651,24 @@ async def test_a_callback_closing_admission_stops_everything_after_it(
 
 
 class ReuseProbe:
-    """Stands in for a held client whose comparison answers with the client
-    itself, so the reuse decision stays this object until it is tested for
-    truth. CPython runs no ``__bool__`` while an ``and`` chain evaluates such an
-    operand: the read lands wherever the decision is used. Closing admission
-    from the second read models a callback that acts only when the decision is
-    read again after the final admission guard; the first read is the early
-    control."""
+    """The servers a held client dials, as a callback would hand them over: the
+    comparison answers with this callback's own object, whose truth is therefore
+    consulted wherever the decision is read (an ``and`` chain coerces each
+    earlier operand and leaves the final one, and the settled result is read
+    again at the branch). Closing admission from the second read models a
+    callback acting when the decision is read after the final admission guard;
+    closing on the first read is the early control. The client itself stays the
+    manager's real one, so its teardown stays owned."""
 
     def __init__(self, manager: ClaudeSessionManager, mode: str) -> None:
         self.manager = manager
         self.mode = mode
-        self.order = 0
-        self.evaluations: list[int] = []
-        self.options = ClaudeAgentOptions(mcp_servers=dict(BAND))
+        self.reads = 0
 
     def _decide(self) -> bool:
-        self.order += 1
-        self.evaluations.append(self.order)
-        late = self.order > 1
-        if (self.mode == "deferred" and late) or (
-            self.mode == "materialized" and not late
-        ):
+        self.reads += 1
+        closing_now = self.reads == 1 if self.mode == "materialized" else self.reads >= 2
+        if closing_now:
             self.manager.close_admission()
         return True
 
@@ -685,6 +681,13 @@ class ReuseProbe:
     __hash__ = None  # type: ignore[assignment]
 
 
+class HeldServers:
+    """A stand-in for the held client's options: only its servers are read."""
+
+    def __init__(self, servers: Any) -> None:
+        self.mcp_servers = servers
+
+
 @pytest.mark.parametrize("mode", ["materialized", "deferred"])
 async def test_the_reuse_decision_is_a_plain_bool_by_the_final_guard(
     tmp_path: Path,
@@ -693,13 +696,12 @@ async def test_the_reuse_decision_is_a_plain_bool_by_the_final_guard(
 ) -> None:
     """The reuse decision is reduced to a plain bool once, inside the fallible
     prerequisite boundary, before the callback-free admission guard. An object
-    answering the currentness comparison cannot defer its effect to the later
-    branch test: closing there still returns nothing (the deferred case), and
-    closing on the first read is refused outright (the control)."""
-    holder: dict[str, ReuseProbe] = {}
-
+    answering the currentness comparison is therefore never asked its truth
+    again: a callback that would close admission at the branch test cannot run
+    there at all (the deferred case), and closing on the first read is refused
+    outright (the control)."""
     def band(room_id: str) -> Any:
-        return holder.get("probe", BAND)
+        return dict(BAND)
 
     manager = ClaudeSessionManager(
         ClaudeAgentOptions(),
@@ -707,37 +709,36 @@ async def test_the_reuse_decision_is_a_plain_bool_by_the_final_guard(
         workspaces=RoomWorkspaces(lambda room_id: str(tmp_path / room_id)),
     )
     claude.mcp_statuses.append([{"name": BAND_MCP_SERVER_NAME, "status": "connected"}])
+    client = await manager.get_or_create_session("room-a")
+    real_options = client.options
+    probe = ReuseProbe(manager, mode)
+    sessions_before = len(claude.sessions)
     try:
-        first = await manager.get_or_create_session("room-a")
-        assert first is not None
-        sessions_before = len(claude.sessions)
-        probe = holder["probe"] = ReuseProbe(manager, mode)
-        manager._sessions["room-a"] = probe
+        client.options = HeldServers(probe)
         if mode == "materialized":  # closes while the decision is materialized
             with pytest.raises(ClaudeSessionManagerStoppedError):
                 await manager.get_or_create_session("room-a")
-        else:  # the attack: a second read, after the final guard
-            assert await manager.get_or_create_session("room-a") is probe, (
-                "a client was returned after admission closed"
-            )
+        else:  # a second read, which the settled decision must never take
+            returned = await manager.get_or_create_session("room-a")
+            assert probe.reads == 1, f"the decision was read {probe.reads} times"
             assert not manager._closing
-        assert probe.evaluations
+            assert returned is client
     finally:
-        manager._sessions.pop("room-a", None)
+        client.options = real_options
         await manager.stop()
+    assert all(not s.alive for s in claude.sessions)
     assert len(claude.sessions) == sessions_before
     assert not manager.owns_resources()
 
 
 class RaisingTruth:
-    """Stands in for a held client whose currentness comparison answers with
-    the client itself and whose truth test raises a secret-bearing error of a
-    builtin type, as a callback-computed step could."""
+    """A callback's servers whose comparison answers with the callback's own
+    object and whose truth test raises a secret-bearing error of a builtin
+    type, as a callback-computed step could."""
 
     def __init__(self, text: str) -> None:
         self.text = text
         self.reads = 0
-        self.options = ClaudeAgentOptions(mcp_servers=dict(BAND))
 
     def __eq__(self, other: object) -> Any:
         return self
@@ -760,11 +761,10 @@ async def test_a_failing_reuse_decision_stays_a_safe_non_resume_failure(
     reservation failure the owner built, with or without a resolver: its text
     carries no callback value, and the adapter never retries the room without
     its history."""
-    holder: dict[str, RaisingTruth] = {}
     secret = "res-ul3t-9a7c"
 
     def band(room_id: str) -> Any:
-        return holder.get("probe", BAND)
+        return dict(BAND)
 
     async def resolver(workspace: str) -> Mapping[str, Any]:
         return {}
@@ -786,12 +786,16 @@ async def test_a_failing_reuse_decision_stays_a_safe_non_resume_failure(
 
     manager.get_or_create_session = counted  # type: ignore[method-assign]
     claude.mcp_statuses.append([{"name": BAND_MCP_SERVER_NAME, "status": "connected"}])
+    client = await manager.get_or_create_session("room-a")
+    probe = RaisingTruth(secret)
+    real_options = client.options
+    real_identity = manager._identities.get("room-a")
+    calls.clear()  # only the adapter's own attempt counts
     try:
-        first = await manager.get_or_create_session("room-a")
-        assert first is not None
-        probe = holder["probe"] = RaisingTruth(secret)
-        manager._sessions["room-a"] = probe
-        calls.clear()  # only the adapter's own attempt counts
+        if with_resolver:  # the retained protected servers are the comparison
+            manager._identities["room-a"] = probe
+        else:  # what the held client dials is the comparison
+            client.options = HeldServers(probe)
         # The decision's truth test runs inside the fallible boundary; the
         # branch test after the callback-free guard reads the settled bool.
         with (
@@ -800,7 +804,9 @@ async def test_a_failing_reuse_decision_stays_a_safe_non_resume_failure(
         ):
             await ClaudeSDKAdapter._open_session(manager, "room-a", "hist-1")
     finally:
-        manager._sessions.pop("room-a", None)
+        client.options = real_options
+        if real_identity is not None:
+            manager._identities["room-a"] = real_identity
         await manager.stop()
     assert probe.reads == 1, f"the decision was read {probe.reads} times"
     error = caught.value
