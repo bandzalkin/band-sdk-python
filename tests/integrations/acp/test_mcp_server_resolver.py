@@ -30,6 +30,7 @@ from band.integrations.acp.client_adapter import (
 )
 from band.integrations.acp.client_runtime import ACPProcessCloseError
 from band.integrations.acp.client_types import ACPClientSessionState
+from band.integrations.mcp import BandMCPBackendStoppedError
 from band.runtime.tools import BAND_MCP_SERVER_NAME
 from tests.integrations.acp.acp_toolkit import (
     DEFAULT_ROOM,
@@ -603,11 +604,13 @@ def record_spawns(adapter: Any, log: list[str]) -> None:
 
 
 def record_close(adapter: Any, room: str, log: list[str]) -> None:
-    """Log ``closed`` once ``room``'s current runtime finishes closing."""
+    """Log ``close entered`` when ``room``'s current runtime starts closing
+    and ``closed`` once it finishes."""
     runtime = adapter._runtimes[room]
     close = runtime.close
 
     async def closing() -> None:
+        log.append("close entered")
         await close()
         log.append("closed")
 
@@ -687,6 +690,21 @@ async def abandon_setup(acp: Any, callback: HeldCallback) -> asyncio.Task[Any]:
     return turn
 
 
+def admission_barrier(adapter: Any) -> asyncio.Event:
+    """An event set as a turn reaches its room's setup registry (right after
+    it has the session's MCP servers, before it joins or starts a setup)."""
+    servers = adapter._session_mcp_servers
+    reached = asyncio.Event()
+
+    async def reaching(*args: Any) -> Any:
+        result = await servers(*args)
+        reached.set()
+        return result
+
+    adapter._session_mcp_servers = reaching
+    return reached
+
+
 async def test_abandoned_setup_holds_the_room_until_it_settles() -> None:
     agent = FakeACPAgent(http=True).will_say("ok")
     log: list[str] = []
@@ -697,7 +715,11 @@ async def test_abandoned_setup_holds_the_room_until_it_settles() -> None:
     ) as acp:
         try:
             await abandon_setup(acp, callback)
+            attempted = admission_barrier(acp.adapter)
             follow_up = asyncio.create_task(acp.send("next"))
+            # The follow-up reaches the room's setup registry while the
+            # abandoned setup is still settling.
+            await attempted.wait()
         finally:
             callback.settle.set()
         reply = await follow_up
@@ -732,7 +754,7 @@ async def test_cleanup_joins_an_abandoned_setup_without_cancelling_again() -> No
         await asyncio.gather(*cleanups)
 
         # The runtime and claim outlived the setup's settlement.
-        assert log == ["settled", "closed"]
+        assert log == ["settled", "close entered", "closed"]
         assert callback.cancellations == 1
         assert agent.sessions == []
         assert DEFAULT_ROOM not in acp.adapter._runtimes
@@ -795,7 +817,7 @@ async def test_external_cleanup_joins_an_already_cancelling_setup() -> None:
         with pytest.raises(asyncio.CancelledError):
             await turn
 
-        assert log == ["settled", "closed"]
+        assert log == ["settled", "close entered", "closed"]
         assert callback.cancellations == 1
         assert agent.sessions == []
         assert DEFAULT_ROOM not in acp.adapter._workspaces.rooms
@@ -825,7 +847,7 @@ async def test_self_retirement_joins_an_already_cancelling_setup() -> None:
             await turn
         await asyncio.wait((retirement.task,))
 
-        assert log == ["settled", "closed"]
+        assert log == ["settled", "close entered", "closed"]
         assert callback.cancellations == 1
         assert agent.sessions == []
         assert DEFAULT_ROOM not in acp.adapter._runtimes
@@ -915,7 +937,7 @@ async def test_restartable_cleanup_admits_rooms_once_it_settles(
             await cleanup
 
     assert reply.thoughts == ["ok"]
-    assert log == ["closed", "spawn"]
+    assert log == ["close entered", "closed", "spawn"]
 
 
 async def test_a_cancelled_joiner_leaves_the_live_joiner_its_cleanup() -> None:
@@ -938,7 +960,7 @@ async def test_a_cancelled_joiner_leaves_the_live_joiner_its_cleanup() -> None:
         await staying
         await new
 
-    assert log == ["closed", "spawn"]
+    assert log == ["close entered", "closed", "spawn"]
 
 
 async def test_a_cancelled_final_caller_still_stops_the_band_server() -> None:
@@ -1035,5 +1057,177 @@ async def test_failed_close_keeps_the_band_server_and_retry_releases_it() -> Non
 
         await acp.adapter.on_started("Fake Agent", "restarted")
         reply = await acp.send("after restart", room="room-1")
+
+    assert reply.thoughts == ["ok"]
+
+
+class ReentrantCallback(HeldCallback):
+    """A setup that asks for teardown from inside itself, then settles.
+
+    ``cancel`` picks how it is already being cancelled when it asks: ``self``
+    cancels its own task and catches it, ``shutdown`` waits until an outside
+    shutdown cancels it, ``none`` asks with no cancellation outstanding.
+    """
+
+    def __init__(self, log: list[str], cancel: str) -> None:
+        super().__init__(log)
+        self.cancel = cancel
+        self.request: Any = None
+
+    async def __call__(self, workspace: str) -> list[ResolvedMcpServer]:
+        self.calls += 1
+        if self.calls > 1:
+            return [http_server()]
+        task = asyncio.current_task()
+        assert task is not None
+        if self.cancel == "self":
+            task.cancel()
+        if self.cancel != "none":
+            self.entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancellations += 1
+        else:
+            self.entered.set()
+        await self.request()
+        self.log.append("request returned")
+        await self.settlement()
+        return [http_server()]
+
+
+def terminate_setups(adapter: Any) -> None:
+    """End setups a deadlocked teardown waits on, so a failing test can finish."""
+    for initializer in list(adapter._session_initializers.values()):
+        initializer.task.cancel()
+    for retirement in list(adapter._retirements.values()):
+        if retirement.setup is not None:
+            retirement.setup.cancel()
+
+
+@pytest.mark.parametrize(
+    ("cancel", "request_kind", "final"),
+    [
+        ("self", "cleanup_all", False),
+        ("self", "cleanup_all", True),
+        ("none", "on_cleanup then cleanup_all", False),
+        ("self", "stop", False),
+        ("shutdown", "cleanup_all", True),
+    ],
+)
+async def test_a_setup_requesting_teardown_does_not_wait_on_itself(
+    cancel: str, request_kind: str, final: bool
+) -> None:
+    agent = FakeACPAgent(http=True).will_say("ok")
+    log: list[str] = []
+    callback = ReentrantCallback(log, cancel)
+
+    async with acp_adapter(
+        agent,
+        fake_agent_config(inject_band_tools=True),
+        resolve_mcp_servers=callback,
+    ) as acp:
+        adapter = acp.adapter
+
+        async def request() -> None:
+            record_close(adapter, DEFAULT_ROOM, log)
+            if request_kind == "stop":
+                await adapter.stop()
+                return
+            if request_kind.startswith("on_cleanup"):
+                await adapter.on_cleanup(DEFAULT_ROOM)
+            await adapter.cleanup_all(final=final)
+
+        callback.request = request
+        turn = asyncio.create_task(acp.send("hello"))
+        await callback.entered.wait()
+        outside = None
+        if cancel == "shutdown":
+            # An outside shutdown already exists when the setup asks to join it.
+            outside = asyncio.create_task(adapter.cleanup_all(final=final))
+        try:
+            async with asyncio.timeout(5):
+                await callback.settling.wait()
+        except TimeoutError:
+            terminate_setups(adapter)
+            raise
+
+        # The request returned while the setup is unsettled: everything the
+        # teardown must release is still held.
+        assert log == ["request returned"]
+        assert DEFAULT_ROOM in adapter._runtimes
+        assert DEFAULT_ROOM in adapter._workspaces.rooms
+        assert adapter._mcp.current is not None
+
+        callback.settle.set()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+        if outside is not None:
+            await outside
+        await adapter.cleanup_all(final=final)
+
+        assert log == ["request returned", "settled", "close entered", "closed"]
+        assert callback.cancellations == (0 if cancel == "none" else 1)
+        assert agent.sessions == []
+        assert adapter._runtimes == {}
+        assert adapter._workspaces.rooms == ()
+        assert adapter._mcp.current is None
+
+        if final:
+            with pytest.raises(ACPAdapterShutDownError):
+                await acp.send("refused", room="room-2")
+            await adapter.on_started("Fake Agent", "restarted")
+        reply = await acp.send("after", room="room-2")
+
+    assert reply.thoughts == ["ok"]
+
+
+async def test_a_final_request_after_shutdown_finished_runs_fresh_final_work() -> None:
+    """A final request arriving once a restartable shutdown finished, before
+    its registration is cleared, still stops the Band server for good: a
+    stale turn continuation then neither restarts it nor opens a session."""
+    agent = FakeACPAgent(http=True).will_say("ok")
+    loop = asyncio.get_running_loop()
+    late: list[asyncio.Task[None]] = []
+
+    async with acp_adapter(agent, fake_agent_config(inject_band_tools=True)) as acp:
+        adapter = acp.adapter
+        await acp.send("before", room="room-1")
+        stale = adapter._runtimes["room-1"]
+        sessions = len(agent.sessions)
+        backend = adapter._mcp.current
+        assert backend is not None
+        stop = backend.stop
+
+        def request_final() -> None:
+            # Runs after the shutdown task finished, before its done callback;
+            # started eagerly so the request is made right then.
+            factory = loop.get_task_factory()
+            loop.set_task_factory(asyncio.eager_task_factory)
+            try:
+                late.append(asyncio.create_task(adapter.cleanup_all(final=True)))
+            finally:
+                loop.set_task_factory(factory)
+
+        async def stopping() -> None:
+            await stop()
+            loop.call_soon(request_final)
+
+        object.__setattr__(backend, "stop", stopping)
+        await adapter.cleanup_all(final=False)
+        await late[0]
+        # The late final request really ran final work: the backend refuses.
+        with pytest.raises(BandMCPBackendStoppedError):
+            await adapter._mcp.ensure()
+
+        with pytest.raises((asyncio.CancelledError, BandMCPBackendStoppedError)):
+            await adapter._get_or_create_session(stale, "room-1", None)
+        assert adapter._mcp.current is None
+        assert len(agent.sessions) == sessions
+        with pytest.raises(ACPAdapterShutDownError):
+            await acp.send("refused", room="room-2")
+
+        await adapter.on_started("Fake Agent", "restarted")
+        reply = await acp.send("after restart", room="room-2")
 
     assert reply.thoughts == ["ok"]

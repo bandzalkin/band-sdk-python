@@ -120,9 +120,13 @@ migrate before upgrading. TypeScript parity is a separate change.
   caller stops neither the teardown nor its hold on new rooms, which are admitted only
   after it settles. Any final call (`Agent.stop()`) makes the whole operation final:
   turns, including ones already waiting, fail with `ACPAdapterShutDownError` until
-  `on_started`, which itself waits for the teardown to finish. If an agent process
-  cannot be confirmed closed, the Band MCP server is kept for it and a later
-  `cleanup_all` retries both.
+  `on_started`, which itself waits for the teardown to finish. A call after the
+  operation finished starts a new one. If an agent process cannot be confirmed closed,
+  the Band MCP server is kept for it and a later `cleanup_all` retries both.
+- Code running inside a room's setup (a `resolve_mcp_servers` callback) may call
+  `on_cleanup`, `cleanup_all` or `stop`: the request returns at once instead of waiting
+  for a teardown that waits for that setup, and the teardown still holds the room's
+  process, workspace and the Band MCP server until the setup returns.
 
 ## Per-room MCP servers
 

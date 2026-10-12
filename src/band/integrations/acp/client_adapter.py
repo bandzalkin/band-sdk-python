@@ -705,7 +705,7 @@ class ACPClientAdapter(
                     raise ACPAdapterShutDownError(
                         "the ACP adapter is shut down until on_started runs again"
                     )
-                shutdown = self._shutdown
+                shutdown = self._active_shutdown()
                 retirement = self._retirements.get(room_id)
                 runtime = self._runtimes.get(room_id)
                 if (
@@ -755,11 +755,11 @@ class ACPClientAdapter(
         # in-flight shutdown settles first: it would otherwise stop the Band
         # server under, or retire, what this start admits.
         while True:
-            if (shutdown := self._shutdown) is not None:
+            if (shutdown := self._active_shutdown()) is not None:
                 await asyncio.wait((shutdown.task,))
                 continue
             await self._mcp.reopen()
-            if self._shutdown is None:
+            if self._active_shutdown() is None:
                 self._shut_down = False
                 return
 
@@ -1195,14 +1195,12 @@ class ACPClientAdapter(
         context; the caller owes it a transcript replay.
         """
         while True:
+            # A turn whose runtime was retired (or whose adapter is shutting
+            # down) must not even start the Band MCP server on its way out.
+            self._require_current_runtime(runtime, room_id)
             mcp = await self._session_mcp_servers(runtime, room_id)
             async with self._session_lock:
-                if (
-                    self._runtimes.get(room_id) is not runtime
-                    or room_id in self._retirements
-                ):
-                    # Retired since this turn took the runtime: never set up on it.
-                    raise asyncio.CancelledError
+                self._require_current_runtime(runtime, room_id)
                 stale = self._room_to_session.get(room_id)
                 if stale is not None and stale.band_url == mcp.band_url:
                     return stale.session_id, False
@@ -1257,6 +1255,17 @@ class ACPClientAdapter(
             raise
         finally:
             await self._release_session_initializer(room_id, initializer)
+
+    def _require_current_runtime(self, runtime: ACPRuntime, room_id: str) -> None:
+        """Refuse a turn whose runtime is no longer the room's, whose room is
+        retiring, or whose adapter is shutting down."""
+        if (
+            self._runtimes.get(room_id) is not runtime
+            or room_id in self._retirements
+            or self._shut_down
+            or self._active_shutdown() is not None
+        ):
+            raise asyncio.CancelledError
 
     @staticmethod
     def _is_spent(
@@ -1884,8 +1893,10 @@ class ACPClientAdapter(
         connection (``_ensure_connection``'s ``can_respawn``) and the MCP backend,
         so ``final=False`` must leave that path open.
         """
-        shutdown = self._shutdown
+        shutdown = self._active_shutdown()
         if shutdown is None:
+            # A registered operation that already finished is history: a later
+            # request, final or a retry, needs fresh shared work.
             shutdown = AdapterShutdown(final=final)
             shutdown.task = asyncio.create_task(
                 self._run_shutdown(shutdown), name="acp-shutdown"
@@ -1898,8 +1909,35 @@ class ACPClientAdapter(
             shutdown.final = True
         if final:
             self._shut_down = True
+        if self._is_setup_being_settled(asyncio.current_task()):
+            # A room setup asking for shutdown from inside: the operation waits
+            # for this very task to settle, so joining it would deadlock. The
+            # setup is invalidated (never cancelled again) and the operation
+            # still holds the runtime, claim and backend until it settles.
+            return
         await asyncio.shield(shutdown.task)
         logger.info("ACP client adapter stopped")
+
+    def _active_shutdown(self) -> AdapterShutdown | None:
+        """The shared shutdown still running; a finished one still registered
+        (its done callback pending) is not."""
+        shutdown = self._shutdown
+        if shutdown is None or shutdown.task.done():
+            return None
+        return shutdown
+
+    def _is_setup_being_settled(self, task: asyncio.Task[Any] | None) -> bool:
+        """Whether ``task`` is a room setup that teardown waits for: one still
+        registered (now invalidated) or one a room retirement already holds."""
+        if task is None:
+            return False
+        for initializer in self._session_initializers.values():
+            if initializer.task is task:
+                initializer.invalidate()
+                return True
+        return any(
+            retirement.setup is task for retirement in self._retirements.values()
+        )
 
     async def _run_shutdown(self, shutdown: AdapterShutdown) -> None:
         async with self._session_lock:
