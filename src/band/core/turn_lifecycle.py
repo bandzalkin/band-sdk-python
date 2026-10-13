@@ -55,6 +55,9 @@ class TurnTask:
         self, *, deadline: float | None = None, cooperative: bool = False
     ) -> None:
         """Start the cleanup grace once; later requests never renew it."""
+        # An external cancellation has the same custody as one sent by this owner.
+        if self.task.cancelling():
+            self._cancel_delivered = True
         if self.deadline is not None:
             return
         bound = deadline if deadline is not None else terminal_deadline()

@@ -98,10 +98,14 @@ workspace path and returning `Mapping[str, CodexMcpServer]`. Import
   auth configuration alone and an empty catalog are not readiness proof.
   Malformed pages, duplicate names, repeated cursors and negative states fail.
   Deadline expiry is checked even if a transport consumes its cancellation.
-- Cancellation and retirement fence startup after each stage. A resolver may
-  request cleanup of its own room without waiting on itself. Cleanup joins a
-  startup already settling cancellation without cancelling it again. Failed close
-  retains the client, workspace claim and scoped diagnostic redactor for retry.
+- Cancellation and retirement fence startup after each stage and before every
+  readiness request, including thread-error recovery. A resolver may request
+  cleanup of its own room without waiting on itself. One invocation owner adopts
+  an already-delivered cancellation and disarms readiness deadlines on cleanup.
+  Settlement beyond the cleanup grace reports incomplete cleanup without another
+  cancellation; the client, workspace claim and turn release remain owned until
+  settlement finishes. Retry room cleanup to close and release the settled client.
+  Failed close retains the client, workspace claim and diagnostic redactor.
   `CodexMcpStartupError.stage` identifies a secret-free startup or validation
   category.
 - With adopted servers, thread start/resume errors trigger a bounded readiness
