@@ -227,13 +227,11 @@ class BaseJsonRpcClient:
             self._pending.pop(request_id, None)
 
         if "error" in response:
-            error = self._redact_value(response.get("error") or {})
+            error = response.get("error") or {}
             raise CodexJsonRpcError(
                 code=int(error.get("code", -32000)),
-                message=self._redact_text(
-                    str(error.get("message", "Unknown JSON-RPC error"))
-                ),
-                data=self._redact_value(error.get("data")),
+                message=str(error.get("message", "Unknown JSON-RPC error")),
+                data=error.get("data"),
             )
         return response.get("result") or {}
 
@@ -321,6 +319,9 @@ class BaseJsonRpcClient:
         if msg_id is not None:
             future = self._pending.get(msg_id)
             if future is not None and not future.done():
+                if "error" in message:
+                    # Freeze diagnostics before teardown releases the secret scope.
+                    message["error"] = self._redact_value(message["error"])
                 future.set_result(message)
             return
 

@@ -1654,7 +1654,7 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
                 task.add_done_callback(task_failure)
                 self._room_cleanup[room_id] = task
             return
-        if startup is not None:
+        if startup is not None and not startup.cancelling():
             startup.cancel()
         await self._retire_room(
             room_id,
@@ -1742,6 +1742,7 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
         room.startup_task = asyncio.current_task()
         room.startup_finished.clear()
         stage = "retirement"
+        readiness: asyncio.Timeout | None = None
         try:
             if room.unusable:
                 await self._retire_client(room)
@@ -1784,10 +1785,11 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
             self._check_startup_current(room, generation)
             stage = "readiness"
             if room.mcp_snapshot is not None and room.mcp_snapshot.expected_names:
-                await self._check_mcp_readiness(client, room, generation)
+                readiness = await self._check_mcp_readiness(client, room, generation)
                 self._check_startup_current(room, generation)
-            room.selected_model = selected_model
             logger.info("Codex model selected: %s", selected_model)
+            self._check_mcp_deadline(readiness)
+            room.selected_model = selected_model
             room.initialized = True
         except BaseException as primary:
             try:
@@ -1824,20 +1826,32 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
             room.startup_task = None
             room.startup_finished.set()
 
+    @staticmethod
+    def _check_mcp_deadline(readiness: asyncio.Timeout | None) -> None:
+        if readiness is None:
+            return
+        deadline = readiness.when()
+        if readiness.expired() or (
+            deadline is not None and asyncio.get_running_loop().time() >= deadline
+        ):
+            raise CodexMcpStartupError("readiness")
+
     async def _check_mcp_readiness(
         self, client: CodexClientProtocol, room: RoomCodexClient, generation: int
-    ) -> None:
+    ) -> asyncio.Timeout:
         snapshot = room.mcp_snapshot
         assert snapshot is not None
         seen_names: set[str] = set()
         cursors: set[str] = set()
         cursor = None
-        async with asyncio.timeout(_MCP_READINESS_TIMEOUT_S):
+        deadline = asyncio.get_running_loop().time() + _MCP_READINESS_TIMEOUT_S
+        async with asyncio.timeout_at(deadline) as readiness:
             while True:
                 raw_page = await client.request(
                     "mcpServerStatus/list",
                     {"cursor": cursor, "limit": 100, "detail": "full"},
                 )
+                self._check_mcp_deadline(readiness)
                 self._check_startup_current(room, generation)
                 page = _McpStatusPage.model_validate(raw_page)
                 for row in page.data:
@@ -1861,6 +1875,8 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
                 cursors.add(cursor)
         if not snapshot.expected_names <= seen_names:
             raise CodexMcpStartupError("readiness")
+        self._check_mcp_deadline(readiness)
+        return readiness
 
     async def _register_skill_roots(self, client: CodexClientProtocol) -> None:
         roots = self.config.skill_roots
@@ -1919,14 +1935,23 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
             data=redactor.value(error.data),
         )
 
-    def _is_required_mcp_error(self, error: CodexJsonRpcError) -> bool:
-        room = self._active_client_state()
-        return bool(
-            room is not None
-            and room.mcp_snapshot is not None
-            and room.mcp_snapshot.expected_names
-            and "mcp" in error.message.lower()
-        )
+    async def _verify_mcp_after_thread_error(self, stage: str) -> None:
+        room = self._require_active_client_state()
+        if room.mcp_snapshot is None or not room.mcp_snapshot.expected_names:
+            return
+        assert room.client is not None
+        try:
+            await self._check_mcp_readiness(room.client, room, room.startup_generation)
+        except BaseException as error:
+            room.unusable = True
+            room.initialized = False
+            if isinstance(error, asyncio.CancelledError):
+                raise asyncio.CancelledError from None
+            logger.debug(
+                "Codex MCP readiness failed after a thread error",
+                exc_info=(CodexMcpStartupError, CodexMcpStartupError(stage), None),
+            )
+            raise CodexMcpStartupError(stage) from None
 
     async def _ensure_thread(
         self,
@@ -1977,8 +2002,7 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
                         )
                     return thread_id
             except CodexJsonRpcError as exc:
-                if self._is_required_mcp_error(exc):
-                    raise CodexMcpStartupError("thread/resume") from None
+                await self._verify_mcp_after_thread_error("thread/resume")
                 logger.warning(
                     "thread/resume failed for room %s thread %s: %s",
                     room_id,
@@ -2006,8 +2030,7 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
                 CodexRequestMethod.THREAD_START, start_params
             )
         except CodexJsonRpcError as error:
-            if self._is_required_mcp_error(error):
-                raise CodexMcpStartupError("thread/start") from None
+            await self._verify_mcp_after_thread_error("thread/start")
             raise self._safe_rpc_error(error) from None
         thread = started.get("thread") if isinstance(started, dict) else {}
         thread_id = str((thread or {}).get("id") or "")

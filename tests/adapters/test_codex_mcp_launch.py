@@ -14,10 +14,12 @@ from dataclasses import FrozenInstanceError, asdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
 
 import pytest
 from pydantic import TypeAdapter
 
+from band.integrations.codex import CodexStdioClient
 from band.integrations.codex.mcp import (
     CodexMcpHttpServer,
     CodexMcpLaunch,
@@ -470,6 +472,41 @@ class TestCodexMcpLaunch:
         second_ref = launched_servers(second, command)["tools"]["bearer_token_env_var"]
         assert first_ref != second_ref
         assert first.env[first_ref] == second.env[second_ref] == "grant"
+
+    @pytest.mark.parametrize(
+        "supplied_env", [False, True], ids=["inherited", "overrides"]
+    )
+    def test_secret_aliases_reserve_effective_stdio_child_environment(
+        self, monkeypatch: pytest.MonkeyPatch, supplied_env: bool
+    ) -> None:
+        namespace = UUID("00000000-0000-0000-0000-000000000005")
+        inherited_name = "BAND_CODEX_MCP_00000000000000000000000000000005_0"
+        override_name = "BAND_CODEX_MCP_00000000000000000000000000000005_1"
+        command = ("codex", "app-server")
+        snapshot = freeze_mcp_servers(
+            {
+                "tools": CodexMcpHttpServer(
+                    "http://localhost/mcp", bearer_token="correct-server-grant"
+                )
+            }
+        )
+        with monkeypatch.context() as scoped:
+            scoped.setattr("band.integrations.codex.mcp.uuid4", lambda: namespace)
+            scoped.setenv(inherited_name, "inherited-value")
+            scoped.setenv(override_name, "inherited-override-value")
+            env = {override_name: "supplied-override-value"} if supplied_env else None
+            launch = snapshot.launch(command, env)
+            client = CodexStdioClient(
+                command=launch.command, env=launch.env, redactor=snapshot.redactor
+            )
+        reference = launched_servers(launch, command)["tools"]["bearer_token_env_var"]
+        assert client.env is not None
+        assert client.env[inherited_name] == "inherited-value"
+        assert client.env[override_name] == (
+            "supplied-override-value" if supplied_env else "inherited-override-value"
+        )
+        assert reference not in {inherited_name, override_name}
+        assert client.env[reference] == "correct-server-grant"
 
     @pytest.mark.parametrize(
         "stage",

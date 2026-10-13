@@ -71,6 +71,87 @@ async def test_rpc_error_message_and_nested_data_are_redacted() -> None:
     assert json.dumps(SECRET)[1:-1] not in json.dumps(error.value.data)
 
 
+async def test_success_results_and_tool_arguments_are_not_redacted() -> None:
+    class Peer(BaseJsonRpcClient):
+        async def _send_json(self, payload: dict[str, Any]) -> None:
+            assert payload["params"] == {"arguments": {"token": SECRET}}
+            await self._dispatch_rpc_message(
+                json.dumps({"id": payload["id"], "result": {"content": [SECRET]}})
+            )
+
+    peer = Peer(redactor=redactor())
+    result = await peer.request("tools/call", {"arguments": {"token": SECRET}})
+    assert result == {"content": [SECRET]}
+    await peer._dispatch_rpc_message(
+        json.dumps(
+            {
+                "id": "server-request",
+                "method": "item/tool/call",
+                "params": {"arguments": {"token": SECRET}},
+            }
+        )
+    )
+    event = await peer.recv_event(timeout_s=1)
+    assert event.params == {"arguments": {"token": SECRET}}
+    assert event.raw["params"] == {"arguments": {"token": SECRET}}
+
+
+async def test_rpc_error_delivered_before_close_is_safe_when_consumed_after() -> None:
+    scope = redactor()
+    client = CodexStdioClient(redactor=scope)
+    sent = asyncio.Event()
+    consume = asyncio.Event()
+    outgoing: list[dict[str, Any]] = []
+
+    def write_request(data: bytes) -> None:
+        outgoing.append(json.loads(data))
+        sent.set()
+
+    async def drain() -> None:
+        await consume.wait()
+
+    async def wait() -> None:
+        return None
+
+    client._proc = SimpleNamespace(
+        stdin=SimpleNamespace(write=write_request, drain=drain, close=lambda: None),
+        wait=wait,
+    )
+    request = asyncio.create_task(client.request("thread/start", {}))
+    try:
+        await asyncio.wait_for(sent.wait(), timeout=1)
+        await client._dispatch_rpc_message(
+            json.dumps(
+                {
+                    "id": outgoing[0]["id"],
+                    "error": {
+                        "code": -32000,
+                        "message": "server denied " + SECRET,
+                        "data": {SECRET: ["Bearer " + SECRET, {"cause": SECRET}]},
+                    },
+                }
+            )
+        )
+        assert not request.done()
+        await client.close()
+        assert scope.text(SECRET) == SECRET
+        assert not request.done()
+        consume.set()
+        with pytest.raises(CodexJsonRpcError) as error:
+            await asyncio.wait_for(request, timeout=1)
+        assert error.value.code == -32000
+        assert error.value.message == "server denied [REDACTED]"
+        assert error.value.data == {
+            "[REDACTED]": ["Bearer [REDACTED]", {"cause": "[REDACTED]"}]
+        }
+        assert SECRET not in str(error.value)
+        assert json.dumps(SECRET)[1:-1] not in json.dumps(error.value.data)
+    finally:
+        consume.set()
+        await asyncio.gather(request, return_exceptions=True)
+        await client.close()
+
+
 async def test_secret_scope_is_retained_until_physical_teardown() -> None:
     scope = redactor()
     client = CodexStdioClient(env={"GENERATED": SECRET}, redactor=scope)

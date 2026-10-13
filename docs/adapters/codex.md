@@ -88,6 +88,7 @@ workspace path and returning `Mapping[str, CodexMcpServer]`. Import
   are not changed.
 - Bearer, header and stdio environment values go into a private child environment
   through generated variable names, never into the generated TOML or argv.
+  Generated names also reserve inherited environment names.
   Secret fields are excluded from descriptor repr, equality and supported
   Pydantic serialization. These runtime objects are not persistence records.
 - Before publishing initialization or starting a thread, the adapter pages
@@ -96,13 +97,21 @@ workspace path and returning `Mapping[str, CodexMcpServer]`. Import
   pre-thread runtime status or `connected` status. Tool-less servers are allowed;
   auth configuration alone and an empty catalog are not readiness proof.
   Malformed pages, duplicate names, repeated cursors and negative states fail.
+  Deadline expiry is checked even if a transport consumes its cancellation.
 - Cancellation and retirement fence startup after each stage. A resolver may
-  request cleanup of its own room without waiting on itself. Failed close retains
-  the client, workspace claim and scoped diagnostic redactor for cleanup retry.
+  request cleanup of its own room without waiting on itself. Cleanup joins a
+  startup already settling cancellation without cancelling it again. Failed close
+  retains the client, workspace claim and scoped diagnostic redactor for retry.
   `CodexMcpStartupError.stage` identifies a secret-free startup or validation
-  category; required-MCP failures during thread start or resume never invoke the
-  missing-history fallback.
+  category.
+- With adopted servers, thread start/resume errors trigger a bounded readiness
+  check, rather than classification by error-message wording. Failed readiness
+  refuses the history fallback and marks the client unusable; the next attempt
+  closes it and resolves a fresh grant. Positive readiness preserves genuine
+  missing-history fallback and unrelated thread errors.
 
 Scoped redaction covers process stderr, malformed RPC diagnostics and forwarded
-RPC errors until owned teardown finishes. Model selection, skill roots, native
+RPC errors. Error frames are sanitized before routing to a waiting request, so
+consumption after owned teardown cannot expose the released secret scope.
+Model selection, skill roots, native
 sandbox/approval settings, real resume and Band's `dynamicTools` path are unchanged.

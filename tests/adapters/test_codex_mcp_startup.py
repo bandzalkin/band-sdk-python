@@ -442,16 +442,22 @@ async def test_required_mcp_failure_never_starts_history_fallback(
     tmp_path: Path, method: CodexRequestMethod
 ) -> None:
     class RequiredFailureClient(StatusClient):
+        failed = False
+
         async def request(
             self, sent: str, params: dict[str, Any] | None = None, **kwargs: Any
         ) -> dict[str, Any]:
             if sent == method:
+                self.failed = True
                 self.requests.append((sent, params or {}))
                 raise CodexJsonRpcError(
                     code=-32002,
                     message="Required MCP startup failed; thread not found secret-sentinel",
                     data={"token": "secret-sentinel"},
                 )
+            if sent == "mcpServerStatus/list" and self.failed:
+                self.requests.append((sent, params or {}))
+                return {"data": [{**ready_row(), "runtimeStatus": "failed"}]}
             return await super().request(sent, params, **kwargs)
 
     client = RequiredFailureClient()
@@ -584,6 +590,9 @@ async def test_missing_history_still_resumes_via_fallback_with_mcp(
             if method == CodexRequestMethod.THREAD_RESUME:
                 self.requests.append((method, params or {}))
                 raise CodexJsonRpcError(code=-32002, message="Thread not found")
+            if method == "mcpServerStatus/list":
+                self.requests.append((method, params or {}))
+                return {"data": [ready_row()]}
             return await super().request(method, params, **kwargs)
 
     client = MissingHistory()

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sys
 import tomllib
@@ -430,13 +431,15 @@ class CodexMcpSnapshot:
     def launch(
         self, command: Sequence[str], env: Mapping[str, str] | None = None
     ) -> CodexMcpLaunch:
+        """Build private overrides with aliases reserved against the full child env."""
         argv = list(_argv(command, "launch", nonempty=True))
         child_env = (
             _string_mapping(env, "launch", environment=True) if env is not None else {}
         )
         self.redactor._register(child_env.values())
         namespace = uuid4().hex.upper()
-        used_names = {name.upper() for name in child_env}
+        used_names = {name.upper() for name in os.environ}
+        used_names.update(name.upper() for name in child_env)
         counter = 0
 
         def secret_ref(value: str) -> str:
