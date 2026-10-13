@@ -10,11 +10,23 @@ from typing import Any
 
 import pytest
 
-from band.integrations.codex import CodexJsonRpcError, CodexStdioClient
+from band.integrations.codex import CodexJsonRpcError, CodexStdioClient, stdio_client
 from band.integrations.codex.mcp import CodexMcpHttpServer, freeze_mcp_servers
 from band.integrations.codex.rpc_base import BaseJsonRpcClient
 
 SECRET = 'sentinel-"quoted"-\\escaped-credential'
+_SYNTHETIC_PGID = 123_456_789
+
+
+@pytest.fixture
+def exited_process_group(monkeypatch: pytest.MonkeyPatch) -> int:
+    def group_ended(pgid: int, _signum: int) -> None:
+        if pgid != _SYNTHETIC_PGID:
+            raise AssertionError("redaction fixture cannot settle another group")
+        raise ProcessLookupError("the synthetic owned group has exited")
+
+    monkeypatch.setattr(stdio_client.os, "killpg", group_ended, raising=False)
+    return _SYNTHETIC_PGID
 
 
 def redactor() -> Any:
@@ -96,7 +108,9 @@ async def test_success_results_and_tool_arguments_are_not_redacted() -> None:
     assert event.raw["params"] == {"arguments": {"token": SECRET}}
 
 
-async def test_rpc_error_delivered_before_close_is_safe_when_consumed_after() -> None:
+async def test_rpc_error_delivered_before_close_is_safe_when_consumed_after(
+    exited_process_group: int,
+) -> None:
     scope = redactor()
     client = CodexStdioClient(redactor=scope)
     sent = asyncio.Event()
@@ -114,6 +128,7 @@ async def test_rpc_error_delivered_before_close_is_safe_when_consumed_after() ->
         return None
 
     client._proc = SimpleNamespace(
+        pid=exited_process_group,
         stdin=SimpleNamespace(write=write_request, drain=drain, close=lambda: None),
         wait=wait,
     )
@@ -152,12 +167,15 @@ async def test_rpc_error_delivered_before_close_is_safe_when_consumed_after() ->
         await client.close()
 
 
-async def test_secret_scope_is_retained_until_physical_teardown() -> None:
+async def test_secret_scope_is_retained_until_physical_teardown(
+    exited_process_group: int,
+) -> None:
     scope = redactor()
     client = CodexStdioClient(env={"GENERATED": SECRET}, redactor=scope)
     exited = asyncio.Event()
 
     class Process:
+        pid = exited_process_group
         stdin = None
 
         async def wait(self) -> None:

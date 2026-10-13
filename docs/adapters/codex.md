@@ -35,6 +35,17 @@ For existing integrations, follow the [SDK 4.x to 5.x migration](../acp.md#upgra
   close errors and close timeouts retain the claim for retry. A timed-out or
   cancelled caller does not abandon subprocess cleanup; retry room cleanup to
   finish releasing ownership. Shutdown attempts every room and reports failures.
+- **POSIX cleanup settles the original owned process group.** After a normal
+  leader exit or an exit timeout, close sends TERM, waits up to one second,
+  then sends KILL and waits up to one more second for `ESRCH`. An unconfirmed
+  group raises `CleanupIncompleteError` and retains the client and workspace
+  claim for retry. The group ID comes from the original subprocess handle,
+  never a lookup of a possibly recycled PID. POSIX groups lack a
+  generation-bound handle: reuse between the original group emptying and the
+  final probe or signal remains a residual race. Descendants that leave the
+  owned group are outside this guarantee. Windows retains best-effort
+  `taskkill /F /T` on leader timeout; it cannot confirm orphaned descendants
+  after normal leader exit or descendants that escape that tree.
 - **Band tools own replies and declines.** Native completed text is optional
   thought telemetry without mentions; it never settles a turn. A native-only
   turn fails the shared missing-reply verdict. `Emit.THOUGHTS` controls visibility.
