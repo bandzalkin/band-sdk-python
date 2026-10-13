@@ -13,6 +13,7 @@ from contextlib import suppress
 from typing import Any
 
 from band.core.exceptions import BandConnectionError
+from band.integrations.codex.mcp import CodexMcpRedactor
 from band.integrations.codex.rpc_base import BaseJsonRpcClient, OverloadRetryPolicy
 
 logger = logging.getLogger(__name__)
@@ -57,8 +58,9 @@ class CodexStdioClient(BaseJsonRpcClient):
         env: Mapping[str, str] | None = None,
         retry_policy: OverloadRetryPolicy | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        redactor: CodexMcpRedactor | None = None,
     ) -> None:
-        super().__init__(retry_policy=retry_policy, sleep=sleep)
+        super().__init__(retry_policy=retry_policy, sleep=sleep, redactor=redactor)
         self._transport_label = "codex output line"
         self.command = tuple(command) if command else self._default_codex_command()
         self.cwd = cwd
@@ -131,10 +133,14 @@ class CodexStdioClient(BaseJsonRpcClient):
             self._close_task.add_done_callback(self._log_close_failure)
         await asyncio.shield(self._close_task)
 
-    @staticmethod
-    def _log_close_failure(task: asyncio.Task[None]) -> None:
+    def _log_close_failure(self, task: asyncio.Task[None]) -> None:
         if not task.cancelled() and (error := task.exception()) is not None:
-            logger.error("Codex subprocess cleanup failed", exc_info=error)
+            if self._redactor is not None:
+                logger.error(
+                    "Codex subprocess cleanup failed: %s", self._redact_text(str(error))
+                )
+            else:
+                logger.error("Codex subprocess cleanup failed", exc_info=error)
 
     async def _close_process(self) -> None:
         readers = [
@@ -154,6 +160,9 @@ class CodexStdioClient(BaseJsonRpcClient):
                 await process.wait()
 
         self._fail_pending("Codex stdio client closed")
+        if self._redactor is not None:
+            self._redactor.clear()
+            self.env = None
 
     async def _send_json(self, payload: dict[str, Any]) -> None:
         if not self._proc or not self._proc.stdin:
@@ -192,7 +201,7 @@ class CodexStdioClient(BaseJsonRpcClient):
                     return
                 text = line.decode("utf-8", errors="replace").rstrip()
                 if text:
-                    logger.debug("codex stderr: %s", text)
+                    logger.debug("codex stderr: %s", self._redact_text(text))
         except asyncio.CancelledError:
             raise
         except Exception:

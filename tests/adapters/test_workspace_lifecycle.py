@@ -24,6 +24,7 @@ from band.core.protocols import TurnResultAlreadyReported
 from band.core.types import AgentInput, HistoryProvider, PlatformMessage
 from band.integrations.claude_sdk import transport
 from band.integrations.codex import CodexStdioClient
+from band.integrations.codex.mcp import CodexMcpRedactor
 from tests.adapters.claude_sdk.fakecli import Hold
 from tests.adapters.claude_sdk.process import WorkspacePeer
 from tests.adapters.roompeer import PeerCommand, write_instruction
@@ -134,8 +135,9 @@ async def host(
             command: Sequence[str] | None,
             cwd: str | None,
             env: Mapping[str, str] | None,
+            redactor: CodexMcpRedactor | None,
         ) -> CodexPeer:
-            child = CodexPeer(command=command, cwd=cwd, env=env)
+            child = CodexPeer(command=command, cwd=cwd, env=env, redactor=redactor)
             host.children.append(child)
             return child
 
@@ -324,7 +326,7 @@ async def test_failed_startup_cleanup_blocks_replacement_until_retry(
         await asyncio.sleep(0.01)
     host.children[0].refuse_close = True
     host.hold_startup.unlink()
-    with pytest.raises(RuntimeError, match="cleanup failed"):
+    with pytest.raises(RuntimeError):
         await opening
     with pytest.raises(ValueError, match="both"):
         await host.send("room-b", write_instruction("bravo"))

@@ -171,7 +171,7 @@ class _FakeCodexClient(RecordedRequests):
 
 
 def patch_codex_client(adapter: CodexAdapter, client: _FakeCodexClient) -> None:
-    def _build(_config: CodexAdapterConfig) -> _FakeCodexClient:
+    def _build(_launch: object) -> _FakeCodexClient:
         return client
 
     adapter._build_client = _build  # type: ignore[method-assign]

@@ -58,3 +58,51 @@ outstanding. The runtime can deliver approval and status controls ahead of that
 pending work through Codex's existing authorization rules. The active turn keeps
 its original tools; an ordinary input rejected before provider invocation is
 retried by the shared room scheduler after that turn releases the session.
+
+## Runtime MCP servers
+
+Pass the keyword-only `resolve_mcp_servers` argument to `CodexAdapter`, not to
+`CodexAdapterConfig`. It is an async callable receiving the room's absolute
+workspace path and returning `Mapping[str, CodexMcpServer]`. Import
+`CodexMcpStdioServer`, `CodexMcpHttpServer`, `CodexMcpServer` and
+`CodexMcpStartupError` from `band.integrations.codex.mcp`.
+
+- `CodexMcpStdioServer(command, args=(), env={}, cwd=None)` describes a stdio
+  server. Arguments and environment values are copied and frozen. Relative
+  commands and arguments are interpreted in the server's `cwd`. Nonempty `env`
+  uses the SDK's Python interpreter to restore generated environment aliases
+  before replacing itself with the server process; native protected environment
+  names are refused.
+- `CodexMcpHttpServer(url, bearer_token=None, headers={})` describes streamable
+  HTTP. SSE and other descriptor types are refused before constructing a client.
+  Names must match `[A-Za-z0-9_-]+`, be unique, and not be the native reserved name
+  `codex_apps`.
+- Resolution happens once for each new client, after any unusable client has
+  closed. Reusing an initialized client does not resolve again. To rotate or revoke
+  a grant on an already running client, clean up the room first; the next startup
+  gets a fresh snapshot. An empty mapping adds no servers or readiness requests.
+- The returned mapping is frozen before startup. Neither adapter configuration
+  nor `codex_env` is changed. Validated native TOML overrides are appended after
+  existing Codex arguments, including after a relay's `--` boundary. Each supplied
+  server is enabled, required, and uses connection readiness. Extra native servers
+  are not changed.
+- Bearer, header and stdio environment values go into a private child environment
+  through generated variable names, never into the generated TOML or argv.
+  Secret fields are excluded from descriptor repr, equality and supported
+  Pydantic serialization. These runtime objects are not persistence records.
+- Before publishing initialization or starting a thread, the adapter pages
+  `mcpServerStatus/list` under one 30-second deadline. Every supplied server must
+  have server information and capabilities, no tool-discovery error, and a null
+  pre-thread runtime status or `connected` status. Tool-less servers are allowed;
+  auth configuration alone and an empty catalog are not readiness proof.
+  Malformed pages, duplicate names, repeated cursors and negative states fail.
+- Cancellation and retirement fence startup after each stage. A resolver may
+  request cleanup of its own room without waiting on itself. Failed close retains
+  the client, workspace claim and scoped diagnostic redactor for cleanup retry.
+  `CodexMcpStartupError.stage` identifies a secret-free startup or validation
+  category; required-MCP failures during thread start or resume never invoke the
+  missing-history fallback.
+
+Scoped redaction covers process stderr, malformed RPC diagnostics and forwarded
+RPC errors until owned teardown finishes. Model selection, skill roots, native
+sandbox/approval settings, real resume and Band's `dynamicTools` path are unchanged.
