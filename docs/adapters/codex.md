@@ -106,6 +106,9 @@ workspace path and returning `Mapping[str, CodexMcpServer]`. Import
   cancellation; the client, workspace claim and turn release remain owned until
   settlement finishes. Retry room cleanup to close and release the settled client.
   Failed close retains the client, workspace claim and diagnostic redactor.
+  Failed worker registration unwinds the gated worker and its ownership records.
+  Invocation-only cleanup timers are closed before control returns to a caller,
+  so they cannot cancel unrelated work that caller performs later.
   `CodexMcpStartupError.stage` identifies a secret-free startup or validation
   category.
 - With adopted servers, thread start/resume errors trigger a bounded readiness

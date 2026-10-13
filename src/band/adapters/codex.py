@@ -59,7 +59,7 @@ from band.core.retention import (
 from band.core.simple_adapter import SimpleAdapter
 from band.core.tool_filter import filter_tool_schemas
 from band.core.turn import judge_detached_turn
-from band.core.turn_lifecycle import ApprovalInterruptMixin, TurnTask, bind_turn_task
+from band.core.turn_lifecycle import ApprovalInterruptMixin, TurnTask
 from band.core.types import (
     AgentInput,
     ApprovalMode,
@@ -996,11 +996,29 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
                 command=command,
             )
         )
-        owner = bind_turn_task(tools, turn)
+        owner = TurnTask(turn)
+        turn.add_done_callback(lambda task: self._forget_turn(room_id, task))
         self._turn_tasks[room_id] = owner
         room.cancellation_owner = owner
-        owner_ready.set_result(owner)
-        turn.add_done_callback(lambda task: self._forget_turn(room_id, task))
+        try:
+            register = getattr(tools, "register_turn_task", None)
+            if callable(register):
+                register(owner)
+            if owner_ready.done():
+                raise asyncio.CancelledError
+            owner_ready.set_result(owner)
+        except BaseException:
+            if not owner_ready.done():
+                owner_ready.cancel()
+            owner.terminate()
+            try:
+                await owner.drain()
+            except asyncio.CancelledError:
+                logger.debug("Codex registration cleanup waiter was interrupted")
+            finally:
+                owner.close()
+                self._forget_turn(room_id, turn)
+            raise
         try:
             await asyncio.wait({release, turn}, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
@@ -1737,9 +1755,12 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
         if room.initialized and not room.unusable:
             return
         room.startup_task = asyncio.current_task()
-        if room.cancellation_owner is None:
+        owner_created = room.cancellation_owner is None
+        if owner_created:
             assert room.startup_task is not None
             room.cancellation_owner = TurnTask(room.startup_task)
+        owner = room.cancellation_owner
+        assert owner is not None
         room.startup_finished.clear()
         stage = "retirement"
         readiness: asyncio.Timeout | None = None
@@ -1825,9 +1846,10 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
         finally:
             room.startup_task = None
             room.startup_finished.set()
-            room_id = self._active_room.get()
-            if room_id not in self._turn_tasks:
-                room.cancellation_owner = None
+            if owner_created:
+                owner.close()
+                if room.cancellation_owner is owner:
+                    room.cancellation_owner = None
 
     @staticmethod
     def _check_mcp_deadline(readiness: asyncio.Timeout | None) -> None:
@@ -1950,6 +1972,8 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
             task = asyncio.current_task()
             assert task is not None
             room.cancellation_owner = TurnTask(task)
+        owner = room.cancellation_owner
+        assert owner is not None
         try:
             await self._check_mcp_readiness(room.client, room, room.startup_generation)
         except BaseException as error:
@@ -1964,7 +1988,9 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
             raise CodexMcpStartupError(stage) from None
         finally:
             if owner_created:
-                room.cancellation_owner = None
+                owner.close()
+                if room.cancellation_owner is owner:
+                    room.cancellation_owner = None
 
     async def _ensure_thread(
         self,
