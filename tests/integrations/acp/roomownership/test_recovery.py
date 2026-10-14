@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 from acp import RequestError
-from acp.schema import LoadSessionResponse
+from acp.schema import LoadSessionResponse, NewSessionResponse
 
 from band.core.model_catalog import ModelSelection
 from band.core.retention import Residency
@@ -18,11 +18,32 @@ from tests.integrations.acp.acp_toolkit import (
     fake_agent_config,
 )
 from tests.integrations.acp.roomownership.kit import (
+    cursor,
     fails_prompt,
     model_select,
     models,
     recover,
 )
+
+
+class WedgedProcessAgent(FakeACPAgent):
+    """The first process refuses every ``session/new`` for as long as it lives;
+    a respawned process opens sessions normally."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._wedged_conn: Any = None
+        self.refusals = 0
+
+    async def new_session(
+        self, cwd: str, mcp_servers: Any = None, **kwargs: Any
+    ) -> NewSessionResponse:
+        if self._wedged_conn is None:
+            self._wedged_conn = self._current_conn
+        if self._current_conn is self._wedged_conn:
+            self.refusals += 1
+            raise RequestError.internal_error()
+        return await super().new_session(cwd, mcp_servers, **kwargs)
 
 
 class TestRecovery:
@@ -98,6 +119,23 @@ class TestRecovery:
             assert failed.errors == ["Internal error"]
             assert session.runtime() is not first_runtime
         assert len(agent.prompts) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("adapter", [acp_adapter, cursor], ids=["acp", "cursor"])
+    async def test_a_process_that_keeps_refusing_sessions_is_not_reused(
+        self, adapter: Any
+    ) -> None:
+        """A broken agent process can refuse every later ``session/new``. The
+        turn that hit it fails; the room's next turn must reach a fresh process
+        instead of retrying the broken one."""
+        agent = WedgedProcessAgent().will_say("Recovered.")
+        async with adapter(agent) as session:
+            with pytest.raises(RequestError):
+                await session.send("first")
+            reply = await session.send("second")
+
+        assert agent.refusals == 1
+        assert reply.thoughts == ["Recovered."]
 
     @pytest.mark.asyncio
     async def test_a_superseded_generation_cannot_recover_its_successor(
