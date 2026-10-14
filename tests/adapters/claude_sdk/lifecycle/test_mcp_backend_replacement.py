@@ -66,18 +66,21 @@ async def test_an_open_room_after_a_crash_resumes_on_the_new_endpoint(
 
 
 async def test_a_message_after_shutdown_is_refused(claude_room: OpenRoom) -> None:
-    """Shutdown closes the backend for good: a late message can't start a
-    server nothing would stop."""
+    """Shutdown closes admission and the backend for good: a late message is
+    refused before it can start a server nothing would stop."""
     room = await claude_room()
     backend = room.adapter._mcp.current
     assert backend is not None
     await room.adapter.cleanup_all()
 
-    with pytest.raises(BandMCPBackendStoppedError):
+    with pytest.raises(ClaudeSessionManagerStoppedError):
         await room.send("hi")
 
     assert backend.is_running is False
+    assert room.adapter._mcp.current is None
     assert room.claude.sessions == []
+    with pytest.raises(BandMCPBackendStoppedError):
+        await room.adapter._mcp.ensure()
 
 
 async def test_a_message_caught_by_shutdown_restarts_nothing(
@@ -101,8 +104,8 @@ async def test_a_message_caught_by_shutdown_restarts_nothing(
 async def test_a_resume_cut_short_by_shutdown_reports_nothing(
     claude_room: OpenRoom,
 ) -> None:
-    """The shutdown lands while a resume is connecting and the resume fails;
-    the fresh-session fallback must meet the stopped manager quietly."""
+    """Shutdown may cancel the owned preparation or refuse the manager's
+    result; neither outcome retries without history or reports a failure."""
     room = await claude_room()
     room.claude.unresumable.add("sess-earlier")
     room.claude.connecting = connecting = Hold()
@@ -112,7 +115,7 @@ async def test_a_resume_cut_short_by_shutdown_reports_nothing(
         stopping = asyncio.create_task(room.adapter.cleanup_all())
         await asyncio.sleep(0)  # cleanup_all reaches the manager's stop()
 
-    with pytest.raises(ClaudeSessionManagerStoppedError):
+    with pytest.raises((asyncio.CancelledError, ClaudeSessionManagerStoppedError)):
         await sending
     await stopping
 

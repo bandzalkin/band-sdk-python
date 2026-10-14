@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -33,8 +37,9 @@ async def test_pre_query_startup_failure_reaps_real_child(
         workspaces=RoomWorkspaces(lambda _: str(tmp_path / "shared")),
     )
     try:
-        expected_error = RuntimeError if cleanup_fails else ValueError
-        with pytest.raises(expected_error):
+        # A failed cleanup is retained for retry; the startup's own error stays
+        # the caller's.
+        with pytest.raises(ValueError):
             await manager.get_or_create_session("room-a")
         assert len(children) == 1
         if cleanup_fails:
@@ -53,3 +58,111 @@ async def test_pre_query_startup_failure_reaps_real_child(
         for child in children:
             child.refuse_close = False
         await manager.stop()
+
+
+class ForgetfulProcess(WorkspaceProcess):
+    """A native close that returns after its waits failed: the child keeps
+    running and the transport forgets it, as the SDK's close can."""
+
+    async def close(self) -> None:
+        self._process = None
+
+
+@asynccontextmanager
+async def started(
+    child_type: type[WorkspaceProcess], tmp_path: Path
+) -> AsyncIterator[tuple[transport.ConfirmedCloseTransport, WorkspaceProcess]]:
+    """An owned transport over a real child, reaped on exit whatever the test
+    asserted."""
+    native = child_type(
+        prompt="",
+        options=ClaudeAgentOptions(
+            cli_path=sys.executable, cwd=str(tmp_path), env={"PROBE_MARKER": "close"}
+        ),
+    )
+    owned = transport.ConfirmedCloseTransport(native)
+    await owned.connect()
+    child = native._child
+    # The test may patch the child's own kill/wait to fail or block; reap with
+    # the class's unpatched operations, and within a bound.
+    kill, wait = type(child).kill, type(child).wait
+    try:
+        yield owned, native
+    finally:
+        if child.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                kill(child)
+            async with asyncio.timeout(10):
+                await wait(child)
+
+
+async def test_a_close_that_falsely_succeeds_still_reaps_the_child(
+    tmp_path: Path,
+) -> None:
+    async with started(ForgetfulProcess, tmp_path) as (owned, native):
+        await owned.close()
+
+        assert native.exited
+        assert not owned.close_pending
+
+
+async def test_an_unconfirmed_exit_keeps_the_child_for_a_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with started(ForgetfulProcess, tmp_path) as (owned, native):
+        child = native._child
+        real_kill = child.kill
+        monkeypatch.setattr(
+            child, "kill", lambda: (_ for _ in ()).throw(PermissionError())
+        )
+
+        with pytest.raises(transport.ClaudeProcessCloseError):
+            await owned.close()
+        assert owned.close_pending
+        assert not native.exited
+
+        monkeypatch.setattr(child, "kill", real_kill)
+        await owned.close()
+
+        assert native.exited
+        assert not owned.close_pending
+
+
+async def test_an_exit_that_never_confirms_fails_within_the_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(transport, "CHILD_EXIT_TIMEOUT_SECONDS", 0.2)
+    async with started(ForgetfulProcess, tmp_path) as (owned, native):
+        child = native._child
+        real_wait = child.wait
+
+        async def never() -> int:
+            await asyncio.Event().wait()
+            return 0
+
+        monkeypatch.setattr(child, "wait", never)
+        async with asyncio.timeout(5):
+            with pytest.raises(transport.ClaudeProcessCloseError):
+                await owned.close()
+        assert owned.close_pending
+
+        monkeypatch.setattr(child, "wait", real_wait)
+        await owned.close()
+        assert native.exited
+        assert not owned.close_pending
+
+
+async def test_a_close_that_raised_keeps_the_child_for_a_retry(tmp_path: Path) -> None:
+    async with started(WorkspaceProcess, tmp_path) as (owned, native):
+        native.refuse_close = True
+
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            await owned.close()
+        assert owned.close_pending
+        assert not native.exited
+
+        native.refuse_close = False
+        await owned.close()
+
+        assert native.exited
+        assert not owned.close_pending

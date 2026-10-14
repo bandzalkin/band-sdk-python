@@ -6,9 +6,15 @@ import asyncio
 import copy
 import itertools
 import json
+import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+import pytest
 
 from band.adapters.claude_sdk import (
     ClaudeApprovalOptions,
@@ -37,6 +43,21 @@ SEND_MESSAGE_MCP_NAME = "mcp__band__band_send_message"
 MISSING_REPLY_TEXT = MISSING_REPLY_FAILURE[1]
 # A native file write, the tool call every approval path is asked about.
 WRITE_NOTE = ModelDecision.call("Write", file_path="notes.md", content="todo")
+
+
+@contextmanager
+def refuse_mcp_removal(path: Path) -> Iterator[None]:
+    """Refuse the real deletion boundary before any private file is removed."""
+    remove = shutil.rmtree
+
+    def refuse(directory: str | Path, *args: Any, **kwargs: Any) -> None:
+        if Path(directory) == path.parent:
+            raise PermissionError("private MCP removal refused")
+        remove(directory, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(shutil, "rmtree", refuse)
+        yield
 
 
 def with_approvals(

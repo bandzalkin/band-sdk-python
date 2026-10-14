@@ -23,6 +23,7 @@ from band.adapters.claude_sdk import (
     ClaudeSDKAdapterConfig,
 )
 from band.core.types import Emit
+from band.integrations.claude_sdk import transport as transport_module
 from band.integrations.claude_sdk.transport import create_transport
 from tests.adapters.claude_sdk.helpers import SEND_MESSAGE_MCP_NAME, ClaudeRoom
 from tests.paths import host_absolute_path
@@ -30,16 +31,30 @@ from tests.paths import host_absolute_path
 OpenRoom = Callable[..., Awaitable[ClaudeRoom]]
 
 
-def test_owned_transport_preserves_sdk_permission_routing() -> None:
+def test_owned_transport_preserves_sdk_permission_routing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI the adapter spawns is told to route permission prompts to the
+    SDK, without the caller's options being rewritten."""
+
     async def allow(
         tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
     ) -> PermissionResultAllow:
         return PermissionResultAllow()
 
+    spawned: list[SubprocessCLITransport] = []
+
+    def spawn(*, prompt: str, options: ClaudeAgentOptions) -> SubprocessCLITransport:
+        native = SubprocessCLITransport(prompt=prompt, options=options)
+        spawned.append(native)
+        return native
+
+    monkeypatch.setattr(transport_module, "SubprocessCLITransport", spawn)
     options = ClaudeAgentOptions(cli_path=sys.executable, can_use_tool=allow)
-    transport = create_transport(options)
-    assert isinstance(transport, SubprocessCLITransport)
-    command = transport._build_command()
+    create_transport(options)
+
+    [native] = spawned
+    command = native._build_command()
     assert command[command.index("--permission-prompt-tool") + 1] == "stdio"
     assert options.permission_prompt_tool_name is None
     assert options.can_use_tool is allow
