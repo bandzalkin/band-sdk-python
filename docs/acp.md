@@ -26,6 +26,8 @@ adapter = ACPClientAdapter(config)
 assert adapter.config.command == ("codex-acp",)
 ```
 
+`resolve_mcp_servers` is an optional keyword-only constructor callback.
+
 ## Band tools
 
 - **Injected tools are bound to the room.** With `inject_band_tools` on (the
@@ -112,6 +114,42 @@ migrate before upgrading. TypeScript parity is a separate change.
   the agent's own sandbox when that boundary matters.
 - TCP and custom transports are rejected: one remote process cannot be proven to serve
   exactly one room.
+- A room keeps its runtime and workspace claim until its agent process is confirmed
+  exited: a rejoining room waits for the old process, and one that cannot be reaped is
+  kept (the cleanup raises) only to be retried by the room's next turn or cleanup; it
+  serves no turn, not even one already under way. A setup a
+  cleanup or a leaving turn gave up on also holds the room until it settles, and is
+  cancelled at most once: a setup already being cancelled is waited for, not cancelled
+  again.
+- `cleanup_all` is one shared operation: concurrent calls join it, and cancelling a
+  caller stops neither the teardown nor its hold on new rooms, which are admitted only
+  after it settles. Any final call (`Agent.stop()`) makes the whole operation final:
+  turns, including ones already waiting, fail with `ACPAdapterShutDownError` until
+  `on_started`, which itself waits for the teardown to finish. A call after the
+  operation finished starts a new one. If an agent process cannot be confirmed closed,
+  the Band MCP server is kept for it and a later `cleanup_all` retries both.
+- Code running inside a room's setup (a `resolve_mcp_servers` callback) may call
+  `on_cleanup`, `cleanup_all` or `stop`: the request returns at once instead of waiting
+  for a teardown that waits for that setup, and the teardown still holds the room's
+  process, workspace and the Band MCP server until the setup returns.
+
+## Per-room MCP servers
+
+`resolve_mcp_servers(workspace)` (on `ACPClientAdapter` and `CopilotACPAdapter`) returns
+native `acp.schema` descriptors for a room's workspace. It runs once per session setup,
+after the agent initializes; a reused session keeps its servers, and a restore and its
+fresh-session fallback get the same snapshot. Its result replaces `config.mcp_servers`
+(an empty result leaves none; a failure never falls back to them), except Band's
+routing: a configured `band` entry and the injected Band server follow it unchanged.
+
+- `McpServerStdio` is always accepted; `HttpMcpServer` and `SseMcpServer` only when the
+  agent explicitly advertises that transport in `initialize`. `AcpMcpServer` is refused.
+- Names must be unique and may not be `band`.
+- A refused server fails the turn with `ACPMcpServerResolutionError`, which names the
+  server and transport but never its URL, headers, command or environment. Any failure,
+  including one raised by the callback, retires the room's runtime; the next turn starts
+  fresh.
+- There is no timeout: a callback that never returns holds that room's setup.
 
 ## Session config
 

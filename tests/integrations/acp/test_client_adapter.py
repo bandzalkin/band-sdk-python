@@ -6,6 +6,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlsplit
 
@@ -58,6 +59,12 @@ from tests.mcpclient import endpoint_path
 
 _MOCK_ROOM = "room-123"
 CODEX = ACPClientAdapterConfig(command="codex")
+
+
+async def band_mcp_server(adapter: ACPClientAdapter, room_id: str) -> Any:
+    """The Band MCP server entry the room's sessions are given."""
+    runtime = await adapter._runtime_for(room_id)
+    return (await adapter._session_mcp_servers(runtime, room_id)).servers[-1]
 
 
 def permission_events(tools: FakeAgentTools) -> list[dict[str, object]]:
@@ -298,7 +305,7 @@ class TestACPClientAdapterLocalMcpConfig:
         adapter = ACPClientAdapter(CODEX)
 
         try:
-            server = await adapter._get_or_start_band_mcp_server("room-1")
+            server = await band_mcp_server(adapter, "room-1")
         finally:
             await adapter.cleanup_all()
 
@@ -317,7 +324,7 @@ class TestACPClientAdapterLocalMcpConfig:
         adapter._workspaces.claim("room-1", "/tmp/room-1")
 
         try:
-            server = await adapter._get_or_start_band_mcp_server("room-1")
+            server = await band_mcp_server(adapter, "room-1")
         finally:
             await adapter.cleanup_all()
 
@@ -334,8 +341,8 @@ class TestACPClientAdapterLocalMcpConfig:
         adapter = ACPClientAdapter(CODEX)
 
         with backends_created_by() as starts:
-            first = await adapter._get_or_start_band_mcp_server("room-1")
-            second = await adapter._get_or_start_band_mcp_server("room-1")
+            first = await band_mcp_server(adapter, "room-1")
+            second = await band_mcp_server(adapter, "room-1")
 
         assert first.url == second.url
         assert len(starts.requested) == 1
@@ -359,7 +366,7 @@ class TestACPClientAdapterLocalMcpConfig:
     async def _registered_tool_names(self, adapter: ACPClientAdapter) -> set[str]:
         """The tool names the adapter asks its Band MCP backend to serve."""
         with backends_created_by() as starts:
-            await adapter._get_or_start_band_mcp_server("room-1")
+            await band_mcp_server(adapter, "room-1")
         return {d.name for d in starts.requested[0].tool_definitions}
 
     @pytest.mark.asyncio

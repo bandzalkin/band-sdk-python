@@ -31,11 +31,11 @@ from band.core.types import Capability
 from band.integrations.acp.client_adapter import (
     HISTORY_REPLAY_HEADER,
     NEW_MESSAGE_MARKER_PREFIX,
+    ACPAdapterShutDownError,
     ACPClientAdapter,
     SessionInitializer,
 )
 from band.integrations.acp.client_types import ACPClientSessionState
-from band.integrations.mcp import BandMCPBackendStoppedError
 from band.runtime.formatters import build_participants_message
 from band.runtime.prompts import (
     COMMUNICATION_INSTRUCTIONS,
@@ -726,9 +726,9 @@ async def test_band_tool_call_without_chat_id_lands_in_its_own_room(
 
 @pytest.mark.asyncio
 async def test_a_turn_after_shutdown_is_refused(fake_agent) -> None:
-    """``cleanup_all()`` (as ``Agent.stop()`` calls it) closes the Band MCP
-    backend for good: a late turn fails instead of starting a server nothing
-    would stop."""
+    """``cleanup_all()`` (as ``Agent.stop()`` calls it) shuts the adapter until
+    ``on_started``: a late turn fails before starting a process or a Band MCP
+    server nothing would stop."""
     fake_agent.will_say("ok")
     with backends_created_by() as starts:
         async with acp_adapter(
@@ -737,8 +737,9 @@ async def test_a_turn_after_shutdown_is_refused(fake_agent) -> None:
             await session.send("before shutdown", room="room-1")
             await session.adapter.cleanup_all()
 
-            with pytest.raises(BandMCPBackendStoppedError):
+            with pytest.raises(ACPAdapterShutDownError):
                 await session.send("after shutdown", room="room-2")
+            assert session.adapter._runtimes == {}
 
     assert len(starts.requested) == 1
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
@@ -54,7 +55,9 @@ __all__ = [
     "STDERR_TAIL_LINES",
     "ACPCollectingClient",
     "ACPConnectionProtocol",
+    "ACPProcessCloseError",
     "ACPRuntime",
+    "ACPRuntimeClosedError",
     "ACPSpawnContextProtocol",
     "ChunkSink",
     "ElicitationHandler",
@@ -72,6 +75,15 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+
+class ACPProcessCloseError(RuntimeError):
+    """The ACP agent process could not be confirmed closed; its runtime keeps it
+    for a later ``stop`` to retry."""
+
+
+class ACPRuntimeClosedError(RuntimeError):
+    """The runtime was closed by its owner and will not spawn again."""
 
 
 class ACPRuntime(ACPSessionOperations):
@@ -106,7 +118,19 @@ class ACPRuntime(ACPSessionOperations):
             AbstractAsyncContextManager[tuple[ACPConnectionProtocol, object]] | None
         ) = None
         self._stop_lock = asyncio.Lock()
+        # The spawned agent process, held until it is confirmed reaped.
+        self._process: asyncio.subprocess.Process | None = None
+        self._agent_mcp_http = False
+        self._agent_mcp_sse = False
         self._stderr = ACPStderrDrain(logger)
+        self._closed = False
+
+    async def close(self) -> None:
+        """Stop for good: unlike ``stop``, a closed runtime never respawns, so a
+        caller still holding it cannot start a process its owner no longer
+        tracks. Retry after ``ACPProcessCloseError`` to confirm the process."""
+        self._closed = True
+        await self.stop()
 
     async def start(self, *, respawn: bool = False) -> None:
         """Spawn or respawn the ACP agent subprocess."""
@@ -114,6 +138,12 @@ class ACPRuntime(ACPSessionOperations):
             await self._start(respawn=respawn)
 
     async def _start(self, *, respawn: bool) -> None:
+        if self._closed:
+            raise ACPRuntimeClosedError("the ACP runtime was closed")
+        if self.close_pending:
+            raise ACPProcessCloseError(
+                "the previous ACP agent process is not confirmed closed"
+            )
         self._connection_failed = False
         logger.info(
             "%s ACP agent subprocess",
@@ -125,6 +155,7 @@ class ACPRuntime(ACPSessionOperations):
         try:
             self._conn, transport = await ctx.__aenter__()
             if isinstance(transport, asyncio.subprocess.Process):
+                self._process = transport
                 self._stderr.start(transport)
             await self._initialize_connection(self._conn)
         except (asyncio.CancelledError, KeyboardInterrupt):
@@ -168,6 +199,8 @@ class ACPRuntime(ACPSessionOperations):
             init_kwargs["client_capabilities"] = self._client_capabilities
         init_response = await cast(Any, conn).initialize(**init_kwargs)
         self._agent_mcp_transport = self._select_mcp_transport(init_response)
+        self._agent_mcp_http = self._advertised_mcp(init_response, "http")
+        self._agent_mcp_sse = self._advertised_mcp(init_response, "sse")
         self._agent_supports_session_load = self._select_session_load(init_response)
         self._agent_supports_session_close = self._select_session_close(init_response)
         if self._auth_method:
@@ -177,6 +210,10 @@ class ACPRuntime(ACPSessionOperations):
     async def ensure_connection(self, *, can_respawn: bool) -> ACPConnectionProtocol:
         async with self._stop_lock:
             if self._conn is None:
+                if self.close_pending:
+                    raise ACPProcessCloseError(
+                        "the previous ACP agent process is not confirmed closed"
+                    )
                 if self._ctx is None and can_respawn:
                     await self._start(respawn=False)
                 else:
@@ -191,6 +228,12 @@ class ACPRuntime(ACPSessionOperations):
         return conn
 
     async def stop(self) -> None:
+        """Close the agent connection and confirm its process exited.
+
+        Raises ``ACPProcessCloseError`` when the process cannot be confirmed
+        closed; the runtime then keeps the process handle (``close_pending``) and
+        a later ``stop`` retries the confirmation.
+        """
         ctx: AbstractAsyncContextManager[tuple[ACPConnectionProtocol, object]] | None
         async with self._stop_lock:
             self._stderr.expect_exit(connection_failed=self._connection_failed)
@@ -200,29 +243,92 @@ class ACPRuntime(ACPSessionOperations):
             self._client = None
             self._agent_supports_session_load = False
             self._agent_supports_session_close = False
+            self._agent_mcp_http = False
+            self._agent_mcp_sse = False
             try:
                 if ctx is not None:
                     await ctx.__aexit__(None, None, None)
             except Exception:
                 logger.exception("Error during ACP runtime shutdown")
             finally:
-                await self._stderr.finish()
+                # Confirm the child before draining its stderr: a child the
+                # context left running keeps the pipe open.
+                try:
+                    await self._confirm_process_exit()
+                finally:
+                    await self._stderr.finish()
 
     async def _cleanup_failed_start(
         self,
         ctx: AbstractAsyncContextManager[tuple[ACPConnectionProtocol, object]],
         reason: str,
     ) -> None:
+        # The failed connection and spent context are never reused, whatever
+        # happens below; a process that will not confirm closed stays owned.
+        self._ctx = None
+        self._conn = None
+        self._agent_supports_session_load = False
+        self._agent_supports_session_close = False
+        self._agent_mcp_http = False
+        self._agent_mcp_sse = False
         try:
             await ctx.__aexit__(None, None, None)
         except Exception:
             logger.exception("Error cleaning up ACP subprocess after %s", reason)
         finally:
-            await self._stderr.finish()
-        self._ctx = None
-        self._conn = None
-        self._agent_supports_session_load = False
-        self._agent_supports_session_close = False
+            try:
+                await self._confirm_process_exit()
+            except ACPProcessCloseError:
+                # The start's own error or cancellation is what the caller
+                # reports; the unconfirmed process stays owned
+                # (``close_pending``) for a later stop.
+                logger.exception("ACP subprocess not confirmed closed after %s", reason)
+            finally:
+                await self._stderr.finish()
+
+    async def _confirm_process_exit(self) -> None:
+        """Reap the agent process this runtime spawned, or raise and keep it.
+
+        The spawn context is an async generator: once its exit has run (even if it
+        raised), exiting it again is a no-op that proves nothing about the child.
+        Ownership is therefore the process handle itself, released only once the
+        child is reaped, so a failed close can be retried and the process is never
+        silently abandoned. Connect-only transports carry no process to confirm.
+        """
+        process = self._process
+        if process is None:
+            return
+        if process.returncode is None:
+            try:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                await process.wait()
+            except Exception as error:
+                raise ACPProcessCloseError(
+                    "the ACP agent process could not be confirmed closed"
+                ) from error
+        self._process = None
+
+    @property
+    def close_pending(self) -> bool:
+        """Whether an earlier stop could not confirm the agent process closed;
+        the runtime refuses to start again until a later ``stop`` succeeds."""
+        return self._process is not None and self._ctx is None
+
+    @property
+    def closed(self) -> bool:
+        """Whether ``close`` was called: the runtime never spawns again."""
+        return self._closed
+
+    @property
+    def agent_mcp_http(self) -> bool:
+        """The connected agent explicitly advertised HTTP MCP servers."""
+        return self._agent_mcp_http
+
+    @property
+    def agent_mcp_sse(self) -> bool:
+        """The connected agent explicitly advertised SSE MCP servers."""
+        return self._agent_mcp_sse
 
     @staticmethod
     def _select_mcp_transport(init_response: object) -> BandMCPTransport:
@@ -235,6 +341,14 @@ class ACPRuntime(ACPSessionOperations):
             return BandMCPTransport.SSE
 
         return BandMCPTransport.HTTP
+
+    @staticmethod
+    def _advertised_mcp(init_response: object, transport: str) -> bool:
+        """Only an explicit ``true`` is support: missing, null or false is not, and
+        the preferred Band transport is not evidence either way."""
+        capabilities = getattr(init_response, "agent_capabilities", None)
+        mcp_capabilities = getattr(capabilities, "mcp_capabilities", None)
+        return getattr(mcp_capabilities, transport, None) is True
 
     @staticmethod
     def _select_session_load(init_response: object) -> bool:
