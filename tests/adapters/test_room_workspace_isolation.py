@@ -134,7 +134,7 @@ async def test_model_override_survives_codex_client_rebuild() -> None:
 
     clients = [Client("auto-model-a"), Client("auto-model-b")]
 
-    def build_client(_config: object) -> Client:
+    def build_client(_launch: object) -> Client:
         return clients.pop(0)
 
     adapter = CodexAdapter(CodexAdapterConfig(model=None))
