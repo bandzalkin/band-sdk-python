@@ -1365,28 +1365,20 @@ class ExecutionContext:
         """
         Synchronize backlog via /next API until caught up with WebSocket.
 
-        /next includes unfinished processing messages and gates stopped rooms.
-        Process in platform order until empty or the first queued WebSocket
-        message is reached; remove its queued duplicate before continuing.
+        /next selects unfinished work and gates stopped rooms. A locally
+        skipped head hands recovery to one complete chronological snapshot.
+        Stop at the first queued WebSocket message once its delivery is terminal.
         """
         logger.debug(
             "ExecutionContext %s: Starting /next synchronization", self.room_id
         )
 
-        previous_id: str | None = None
         try:
             while True:
                 revision = self._control_revision
                 next_msg = await self._get_next_message()
                 if revision != self._control_revision:
                     return self._stopped
-                if (
-                    next_msg is not None
-                    and next_msg.id == previous_id
-                    and self._backlog_is_nonrunnable(next_msg)
-                ):
-                    break
-                previous_id = next_msg.id if next_msg is not None else None
 
                 if next_msg is None:
                     logger.debug(
@@ -1396,13 +1388,17 @@ class ExecutionContext:
                     self._sync_complete = True
                     return True
 
-                if self._retry_tracker.is_permanently_failed(next_msg.id):
-                    logger.warning(
-                        "ExecutionContext %s: Skipping permanently failed message %s",
-                        self.room_id,
-                        next_msg.id,
+                if self._backlog_is_nonrunnable(next_msg):
+                    await self._process_backlog_message(next_msg, revision=revision)
+                    if revision != self._control_revision:
+                        return self._stopped
+                    outcome = await self._recover_actionable_backlog(
+                        next_msg, sync_to_websocket=True
                     )
-                    break
+                    synchronized = outcome in {ResyncOutcome.EMPTY, ResyncOutcome.WORK}
+                    if synchronized:
+                        self._sync_complete = True
+                    return synchronized
 
                 at_sync_point = next_msg.id == self._first_ws_msg_id
                 level = logging.INFO if at_sync_point else logging.DEBUG
@@ -1421,12 +1417,22 @@ class ExecutionContext:
                 }:
                     self._set_deferred_head(next_msg.id)
                     return False
-                if at_sync_point:
+                if revision != self._control_revision:
+                    return self._stopped
+                if (
+                    next_msg.id == self._deferred_message_id
+                    and self._backlog_is_nonrunnable(next_msg)
+                ):
+                    self._set_deferred_head(None)
+                if at_sync_point and self._backlog_is_nonrunnable(next_msg):
                     # Preserve other queued events when removing the sync point.
                     self._drain_duplicate_from_queue(next_msg.id)
                     self._first_ws_msg_id = None
                     self._sync_complete = True
                     return True
+                if at_sync_point:
+                    self._set_deferred_head(next_msg.id)
+                    return False
 
                 if self._stopped:
                     # A stop control signal landed mid-cycle: the message was
@@ -1442,14 +1448,6 @@ class ExecutionContext:
                     )
                     break
 
-                if self._retry_tracker.is_permanently_failed(next_msg.id):
-                    logger.warning(
-                        "ExecutionContext %s: Message %s permanently failed",
-                        self.room_id,
-                        next_msg.id,
-                    )
-                    break
-
         except Exception:
             logger.exception("ExecutionContext %s: Sync error", self.room_id)
             return False
@@ -1457,6 +1455,63 @@ class ExecutionContext:
         logger.debug("ExecutionContext %s: Synchronization complete", self.room_id)
         self._sync_complete = True
         return True
+
+    async def _recover_actionable_backlog(
+        self, head: PlatformMessage, *, sync_to_websocket: bool = False
+    ) -> ResyncOutcome:
+        """Drain one complete FIFO snapshot without re-polling a retained head."""
+        revision = self._control_revision
+        messages = await self.link.get_actionable_messages(self.room_id)
+        if revision != self._control_revision:
+            return ResyncOutcome.BLOCKED
+        if head.id == self._deferred_message_id:
+            self._set_deferred_head(None)
+        if (
+            not sync_to_websocket
+            and self._deferred_message_id is None
+            and self._pending_synthetic
+        ):
+            return ResyncOutcome.BLOCKED
+        if sync_to_websocket and head.id == self._first_ws_msg_id:
+            # /next selected this terminal marker before the snapshot; later
+            # rows must not overtake queued events even if it is no longer listed.
+            self._drain_duplicate_from_queue(head.id)
+            self._first_ws_msg_id = None
+            self._sync_complete = True
+            return ResyncOutcome.EMPTY
+        for msg in messages:
+            if self._stopped:
+                return ResyncOutcome.STOPPED
+            if revision != self._control_revision:
+                return ResyncOutcome.BLOCKED
+            try:
+                result = await self._process_backlog_message(msg, revision=revision)
+            except Exception:
+                self._set_deferred_head(msg.id)
+                raise
+            if self._stopped:
+                return ResyncOutcome.STOPPED
+            if revision != self._control_revision:
+                return ResyncOutcome.BLOCKED
+            if result is BacklogProcessResult.NOT_ACCEPTED:
+                self._set_deferred_head(msg.id)
+                return ResyncOutcome.BLOCKED
+            if (
+                result is BacklogProcessResult.RETRY_LATER
+                or not self._backlog_is_nonrunnable(msg)
+            ):
+                self._set_deferred_head(msg.id)
+                return ResyncOutcome.RETRY
+            if msg.id == self._deferred_message_id:
+                self._set_deferred_head(None)
+            if sync_to_websocket and msg.id == self._first_ws_msg_id:
+                self._drain_duplicate_from_queue(msg.id)
+                self._first_ws_msg_id = None
+                self._sync_complete = True
+                break
+            if self._pending_synthetic:
+                return ResyncOutcome.BLOCKED
+        return ResyncOutcome.WORK if self._resync_handled_work else ResyncOutcome.EMPTY
 
     async def _get_next_message(self) -> PlatformMessage | None:
         """
@@ -1477,7 +1532,6 @@ class ExecutionContext:
                 event = self._pending_synthetic.popleft()
                 if not await self._process_event(event):
                     return ResyncOutcome.BLOCKED
-        previous_id: str | None = None
         try:
             while True:
                 revision = self._control_revision
@@ -1496,12 +1550,14 @@ class ExecutionContext:
                         if self._resync_handled_work
                         else ResyncOutcome.EMPTY
                     )
-                if (
-                    next_msg.id == previous_id
-                    and self._backlog_is_nonrunnable(next_msg)
-                ) or self._retry_tracker.is_permanently_failed(next_msg.id):
-                    return ResyncOutcome.BLOCKED
-                previous_id = next_msg.id
+                if self._backlog_is_nonrunnable(next_msg):
+                    outcome = await self._recover_actionable_backlog(next_msg)
+                    # A retained /next head is not positive evidence of an empty room.
+                    return (
+                        ResyncOutcome.BLOCKED
+                        if outcome is ResyncOutcome.EMPTY
+                        else outcome
+                    )
                 result = await self._process_backlog_message(
                     next_msg, revision=revision
                 )
@@ -1528,6 +1584,7 @@ class ExecutionContext:
         return (
             self.claims.is_completed(self.room_id, msg.id)
             or self._retry_tracker.is_permanently_failed(msg.id)
+            or self._delivery_status_for_agent(msg.metadata) == DeliveryStatus.PROCESSED
             or bool(
                 self._agent_id
                 and is_self_echo(
