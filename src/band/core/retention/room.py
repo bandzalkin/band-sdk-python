@@ -548,7 +548,7 @@ class RetainedRoom:
         current = asyncio.current_task()
         if not self.enrolls(current):
             return False
-        if current is not None and current in self._owned:
+        if current is not None:
             self._unwinding.add(current)
         return True
 
@@ -615,6 +615,7 @@ class RetainedRoom:
                 self._state == Residency.ACQUIRING
                 and self._transition is not None
                 and not self._transition.cancelling()
+                and self._transition not in self._unwinding
             ):
                 self._transition.cancel()
         await self._drained.wait()
