@@ -95,6 +95,162 @@ jobs:
     - name: Collect baseline E2E in the core environment
       run: uv run --all-packages pytest tests/e2e/baseline/ --collect-only -q --no-cov
 
+    - name: Install temporary U2D stall observer (diagnostic only)
+      run: |
+        cat > "$RUNNER_TEMP/u2d_stall_observer.py" <<'PY'
+        """Diagnostic-only pytest plugin: dump await chains at the moment a target stalls.
+
+        No profiler, no periodic timers, no clock patches. Deferral: the test's own
+        ``wait_for_condition`` is wrapped for that one item; when it times out, every
+        task's await chain, the ready queue, scheduled timers and all thread stacks are
+        dumped from inside the loop before the test's cleanup runs. Shutdown: the
+        fixture's ``ctx.stop`` is wrapped for that one item with a single one-shot
+        timer at 0.45 s (below the 0.5 s assertion) that dumps the same state if stop
+        is still pending.
+        """
+
+        from __future__ import annotations
+
+        import asyncio
+        import functools
+        import json
+        import os
+        import sys
+        import threading
+        import time
+        import traceback
+
+        import pytest
+
+        DEFERRAL = "test_approval_beyond_first_page_releases_ordered_work"
+        SHUTDOWN = "test_stop_returns_quickly_when_idle"
+        STOP_STALL_S = 0.45
+        DUMPS: list[dict] = []
+        SAMPLES: list[dict] = []
+
+
+        def _frame(frame) -> dict:
+            return {"file": frame.f_code.co_filename, "line": frame.f_lineno, "function": frame.f_code.co_qualname if hasattr(frame.f_code, "co_qualname") else frame.f_code.co_name}
+
+
+        def _await_chain(awaitable) -> list[dict]:
+            chain: list[dict] = []
+            seen: set[int] = set()
+            while awaitable is not None and id(awaitable) not in seen and len(chain) < 64:
+                seen.add(id(awaitable))
+                frame = getattr(awaitable, "cr_frame", None) or getattr(awaitable, "gi_frame", None) or getattr(awaitable, "ag_frame", None)
+                if frame is not None:
+                    chain.append(_frame(frame))
+                    awaitable = getattr(awaitable, "cr_await", None) or getattr(awaitable, "gi_yieldfrom", None) or getattr(awaitable, "ag_await", None)
+                    continue
+                entry = {"awaiting": type(awaitable).__qualname__}
+                if isinstance(awaitable, asyncio.Task):
+                    entry["task"] = awaitable.get_name()
+                elif isinstance(awaitable, asyncio.Future):
+                    entry["done"] = awaitable.done()
+                    entry["callbacks"] = [repr(cb)[:160] for cb in (getattr(awaitable, "_callbacks", None) or [])][:8]
+                else:
+                    entry["repr"] = repr(awaitable)[:200]
+                chain.append(entry)
+                break
+            return chain
+
+
+        def _callback_name(handle) -> str:
+            cb = getattr(handle, "_callback", None)
+            return repr(cb)[:200]
+
+
+        def dump(phase: str, nodeid: str, loop: asyncio.AbstractEventLoop) -> None:
+            now = loop.time()
+            tasks = []
+            for task in asyncio.all_tasks(loop):
+                waiter = getattr(task, "_fut_waiter", None)
+                tasks.append({
+                    "name": task.get_name(),
+                    "done": task.done(),
+                    "cancelling": task.cancelling() if hasattr(task, "cancelling") else None,
+                    "chain": _await_chain(task.get_coro()),
+                    "fut_waiter": None if waiter is None else {"type": type(waiter).__qualname__, "repr": repr(waiter)[:240]},
+                })
+            timers = sorted(
+                ({"in_s": round(h.when() - now, 6), "cancelled": h.cancelled(), "callback": _callback_name(h)} for h in getattr(loop, "_scheduled", ())),
+                key=lambda t: t["in_s"],
+            )
+            ready = [_callback_name(h) for h in list(getattr(loop, "_ready", ()))]
+            threads = {}
+            names = {t.ident: t.name for t in threading.enumerate()}
+            for ident, frame in sys._current_frames().items():
+                threads[names.get(ident, str(ident))] = [ {"file": f.filename, "line": f.lineno, "function": f.name} for f in traceback.extract_stack(frame)[-12:] ]
+            DUMPS.append({"node": nodeid, "phase": phase, "loop_time": now, "loop_type": type(loop).__qualname__, "tasks": tasks, "timers": timers[:60], "timer_count": len(timers), "ready": ready, "threads": threads})
+
+
+        def _wrap_wait(original, nodeid: str):
+            @functools.wraps(original)
+            async def wait_for_condition(*args, **kwargs):
+                started = time.perf_counter()
+                try:
+                    return await original(*args, **kwargs)
+                except pytest.fail.Exception:
+                    dump(f"wait_for_condition timed out after {time.perf_counter() - started:.3f}s wall", nodeid, asyncio.get_running_loop())
+                    raise
+            return wait_for_condition
+
+
+        def _wrap_stop(ctx, nodeid: str) -> None:
+            original = ctx.stop
+
+            async def stop(*args, **kwargs):
+                loop = asyncio.get_running_loop()
+                started_wall, started_loop = time.perf_counter(), loop.time()
+                handle = loop.call_later(STOP_STALL_S, dump, f"stop pending at {STOP_STALL_S}s loop time", nodeid, loop)
+                try:
+                    return await original(*args, **kwargs)
+                finally:
+                    handle.cancel()
+                    SAMPLES.append({"node": nodeid, "stop_wall_s": time.perf_counter() - started_wall, "stop_loop_s": loop.time() - started_loop})
+
+            ctx.stop = stop
+
+
+        @pytest.hookimpl(hookwrapper=True)
+        def pytest_runtest_call(item):
+            name = getattr(item, "originalname", None)
+            restore = None
+            if name == DEFERRAL and item.nodeid.endswith("[live]"):
+                module = item.module
+                original = module.wait_for_condition
+                module.wait_for_condition = _wrap_wait(original, item.nodeid)
+                restore = lambda: setattr(module, "wait_for_condition", original)  # noqa: E731
+            elif name == SHUTDOWN and "ctx" in getattr(item, "funcargs", {}):
+                _wrap_stop(item.funcargs["ctx"], item.nodeid)
+            try:
+                yield
+            finally:
+                if restore is not None:
+                    restore()
+
+
+        def pytest_terminal_summary(terminalreporter):
+            if not DUMPS and not SAMPLES:
+                return
+            terminalreporter.write_sep("=", "U2D STALL OBSERVER")
+            for sample in SAMPLES:
+                terminalreporter.write_line("U2D_STOP " + json.dumps(sample, sort_keys=True))
+            for record in DUMPS:
+                terminalreporter.write_line("U2D_STALL " + json.dumps(record, sort_keys=True))
+            out = os.environ.get("U2D_OBSERVER_OUT")
+            if out:
+                with open(out, "a", encoding="utf-8") as handle:
+                    for record in DUMPS:
+                        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        PY
+        {
+          echo "PYTHONPATH=$RUNNER_TEMP"
+          echo "PYTEST_PLUGINS=u2d_stall_observer"
+          echo "U2D_OBSERVER_OUT=$RUNNER_TEMP/u2d-stall.jsonl"
+        } >> "$GITHUB_ENV"
+
     - name: Run tests
       run: uv run --all-packages pytest
 
