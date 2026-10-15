@@ -1,0 +1,89 @@
+# Builds band-agent's SDK revision daily: upstream main, this fork's own commits, then each
+# pull request listed in .github/band-agent/prs.txt at its current upstream head.
+# See FORK-CHANGES.md for the rules and the manual procedures.
+name: band-agent-replay
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily 06:17 UTC; band-agent's SDK fork watch runs at 07:30
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: band-agent-replay
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: band-ai/band-sdk-python
+  STAGED_BRANCH: band-agent-patches-latest
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: band-agent-patches
+          fetch-depth: 0
+
+      - name: Build upstream main plus the listed pull requests
+        id: replay
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git config user.name "band-agent-fork-bot"
+          git config user.email "band-agent-fork-bot@users.noreply.github.com"
+          python3 .github/band-agent/replay.py
+
+      - uses: astral-sh/setup-uv@v6
+        if: steps.replay.outputs.changed == 'true'
+
+      - name: Validate the replayed SDK
+        if: steps.replay.outputs.changed == 'true'
+        run: |
+          uv sync --all-packages --locked --extra dev
+          uv run --all-packages pre-commit run --all-files
+          uv run --all-packages pytest -q
+
+      # The staged branch is force-pushed every time upstream moves, which would orphan a
+      # commit band-agent pins; the tag keeps every staged revision fetchable by its SHA.
+      - name: Push the staged revision
+        if: steps.replay.outputs.changed == 'true'
+        run: |
+          git push origin "HEAD:refs/tags/staged/$(date -u +%Y-%m-%d)-$(git rev-parse --short=12 HEAD)"
+          git push --force-with-lease origin "HEAD:${STAGED_BRANCH}"
+
+      - name: Summarize
+        env:
+          TARGET: ${{ steps.replay.outputs.target }}
+          CHANGED: ${{ steps.replay.outputs.changed }}
+          APPLIED: ${{ steps.replay.outputs.applied }}
+          MERGED: ${{ steps.replay.outputs.merged }}
+          CLOSED: ${{ steps.replay.outputs.closed }}
+          NOTES: ${{ steps.replay.outputs.notes }}
+        run: |
+          {
+            echo "## band-agent-replay"
+            if [ "$CHANGED" = true ]; then
+              echo "Staged \`${STAGED_BRANCH}\` at $(git rev-parse HEAD) over upstream ${TARGET}."
+            else
+              echo "\`${STAGED_BRANCH}\` already matches upstream ${TARGET} plus the listed pull requests."
+            fi
+            echo ""
+            echo "Applied: ${APPLIED:-none}."
+            if [ -n "$MERGED" ]; then
+              echo ""
+              echo "Merged upstream, skipped: ${MERGED}. Remove them from .github/band-agent/prs.txt."
+            fi
+            if [ -n "$CLOSED" ]; then
+              echo ""
+              echo "Closed upstream, skipped: ${CLOSED}. Remove them from .github/band-agent/prs.txt."
+            fi
+            if [ -n "$NOTES" ]; then
+              echo ""
+              echo "Notes: ${NOTES}."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
