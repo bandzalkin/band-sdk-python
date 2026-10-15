@@ -95,6 +95,284 @@ jobs:
     - name: Collect baseline E2E in the core environment
       run: uv run --all-packages pytest tests/e2e/baseline/ --collect-only -q --no-cov
 
+    - name: Install temporary U2D watchdog observer (diagnostic only)
+      if: matrix.os == 'ubuntu-latest' && (matrix.python-version == '3.11' || matrix.python-version == '3.12')
+      run: |
+        cat > "$RUNNER_TEMP/u2d_watchdog_observer.py" <<'PY'
+        """Diagnostic-only pytest plugin for two target tests (fork CI only).
+
+        During each target test call, a daemon thread samples the test thread's stack
+        every 100 ms into a bounded ring: filename, function and line only, never
+        locals or frame objects. Each sample records its monotonic timestamp, the gap
+        since the previous sample, and process CPU time. The thread is stopped and
+        joined when the call ends.
+
+        Limits: a Python watchdog only runs when it can take the GIL. A sample gap well
+        above 100 ms means the watchdog itself was not scheduled (GIL held continuously,
+        or the host stalled); it is an observation gap, not a stack of its cause. A stack
+        held across samples whose top is the selector (``select``/``poll``/``epoll``) is
+        the loop waiting for I/O or a timer, i.e. healthy async waiting, not a
+        synchronous block.
+
+        No event-loop timers, profiler or clock patches. The deferral target's own
+        ``wait_for_condition`` is wrapped so its timeout dumps every task's await chain
+        from inside the loop before the test's cleanup; the shutdown target's
+        ``ctx.stop`` is wrapped only to record wall/loop/CPU elapsed time.
+        """
+
+        from __future__ import annotations
+
+        import asyncio
+        import collections
+        import functools
+        import json
+        import os
+        import sys
+        import threading
+        import time
+
+        import pytest
+
+        DEFERRAL = "test_approval_beyond_first_page_releases_ordered_work"
+        SHUTDOWN = "test_stop_returns_quickly_when_idle"
+        INTERVAL_S = 0.1
+        RING = 1200
+        STACK_DEPTH = 40
+        HELD_REPORT_S = 0.3
+        WATCHDOG_NAME = "u2d-watchdog"
+        SELECTOR_FUNCTIONS = frozenset({"select", "poll", "epoll", "_run_once"})
+        RECORDS: list[dict] = []
+        ERRORS: list[str] = []
+
+
+        def _stack(frame) -> list[list]:
+            """Innermost STACK_DEPTH frames, outermost first, as plain values."""
+            entries = []
+            while frame is not None and len(entries) < STACK_DEPTH:
+                entries.append([frame.f_code.co_filename, frame.f_code.co_name, frame.f_lineno])
+                frame = frame.f_back
+            entries.reverse()
+            return entries
+
+
+        class Watchdog:
+            def __init__(self, target_ident: int) -> None:
+                self.target_ident = target_ident
+                self.samples: collections.deque = collections.deque(maxlen=RING)
+                self.dropped = 0
+                self.errors: list[str] = []
+                self._stop = threading.Event()
+                self._thread = threading.Thread(target=self._run, name=WATCHDOG_NAME, daemon=True)
+                self.started = time.monotonic()
+
+            def start(self) -> None:
+                self._thread.start()
+
+            def _run(self) -> None:
+                previous = time.monotonic()
+                while not self._stop.wait(INTERVAL_S):
+                    try:
+                        now = time.monotonic()
+                        frame = sys._current_frames().get(self.target_ident)
+                        stack = _stack(frame) if frame is not None else []
+                        del frame
+                        if len(self.samples) == self.samples.maxlen:
+                            self.dropped += 1
+                        self.samples.append({
+                            "t": round(now - self.started, 6),
+                            "gap": round(now - previous, 6),
+                            "cpu": round(time.process_time(), 6),
+                            "stack": stack,
+                        })
+                        previous = now
+                    except Exception as error:  # noqa: BLE001 - observer errors are reported, never raised
+                        self.errors.append(f"{type(error).__name__}: {error}")
+
+            def stop(self) -> bool:
+                self._stop.set()
+                self._thread.join(timeout=5)
+                return not self._thread.is_alive()
+
+
+        def held_runs(samples) -> list[dict]:
+            """Consecutive samples with an identical stack lasting at least HELD_REPORT_S."""
+            runs, start = [], 0
+            for index in range(1, len(samples) + 1):
+                if index < len(samples) and samples[index]["stack"] == samples[start]["stack"]:
+                    continue
+                first, last = samples[start], samples[index - 1]
+                held = last["t"] - first["t"]
+                if held >= HELD_REPORT_S and first["stack"]:
+                    top = first["stack"][-1]
+                    runs.append({
+                        "from_t": first["t"], "to_t": last["t"], "held_s": round(held, 6),
+                        "samples": index - start, "cpu_s": round(last["cpu"] - first["cpu"], 6),
+                        "top": top,
+                        "kind": "selector-wait" if top[1] in SELECTOR_FUNCTIONS else "same-frame",
+                    })
+                start = index
+            return runs
+
+
+        def _loop_info(loop) -> dict:
+            time_fn = getattr(loop, "time", None)
+            return {
+                "loop_type": f"{type(loop).__module__}.{type(loop).__qualname__}",
+                "time_fn": f"{getattr(time_fn, '__module__', None)}.{getattr(time_fn, '__qualname__', None)}",
+                "looptime_on": getattr(loop, "looptime_on", None),
+            }
+
+
+        def _await_chain(awaitable) -> list:
+            chain, seen = [], set()
+            while awaitable is not None and id(awaitable) not in seen and len(chain) < 64:
+                seen.add(id(awaitable))
+                frame = getattr(awaitable, "cr_frame", None) or getattr(awaitable, "gi_frame", None) or getattr(awaitable, "ag_frame", None)
+                if frame is None:
+                    chain.append({"awaiting": type(awaitable).__qualname__})
+                    break
+                chain.append([frame.f_code.co_filename, frame.f_code.co_name, frame.f_lineno])
+                awaitable = getattr(awaitable, "cr_await", None) or getattr(awaitable, "gi_yieldfrom", None) or getattr(awaitable, "ag_await", None)
+            return chain
+
+
+        def _await_dump(loop) -> dict:
+            now = loop.time()
+            tasks = []
+            for task in asyncio.all_tasks(loop):
+                waiter = getattr(task, "_fut_waiter", None)
+                tasks.append({
+                    "name": task.get_name(), "done": task.done(),
+                    "cancelling": task.cancelling() if hasattr(task, "cancelling") else None,
+                    "chain": _await_chain(task.get_coro()),
+                    "fut_waiter": None if waiter is None else repr(waiter)[:240],
+                })
+            timers = sorted(
+                ({"in_s": round(h.when() - now, 6), "cancelled": h.cancelled(), "callback": repr(getattr(h, "_callback", None))[:200]} for h in getattr(loop, "_scheduled", ())),
+                key=lambda t: t["in_s"],
+            )
+            return {"tasks": tasks, "timers": timers[:60], "timer_count": len(timers), "ready": [repr(getattr(h, "_callback", None))[:200] for h in list(getattr(loop, "_ready", ()))]}
+
+
+        class Target:
+            def __init__(self, nodeid: str) -> None:
+                self.record: dict = {"node": nodeid, "events": []}
+                self.loop = None
+
+            def mark(self, label: str, loop=None, **extra) -> None:
+                if loop is not None and self.loop is None:
+                    self.loop = loop
+                    self.record["loop"] = _loop_info(loop)
+                loop = loop or self.loop
+                event = {"label": label, "wall": time.monotonic(), "cpu": time.process_time(), **extra}
+                if loop is not None and not loop.is_closed():
+                    event["loop_time"] = loop.time()
+                self.record["events"].append(event)
+
+
+        def _wrap_wait(original, target: Target):
+            @functools.wraps(original)
+            async def wait_for_condition(*args, **kwargs):
+                loop = asyncio.get_running_loop()
+                target.mark("wait_for_condition-enter", loop)
+                try:
+                    result = await original(*args, **kwargs)
+                except pytest.fail.Exception:
+                    target.mark("wait_for_condition-timeout", loop)
+                    target.record["await_dump"] = _await_dump(loop)
+                    raise
+                target.mark("wait_for_condition-return", loop)
+                return result
+            return wait_for_condition
+
+
+        def _wrap_stop(ctx, target: Target) -> None:
+            original = ctx.stop
+
+            async def stop(*args, **kwargs):
+                loop = asyncio.get_running_loop()
+                target.mark("stop-enter", loop)
+                try:
+                    return await original(*args, **kwargs)
+                finally:
+                    target.mark("stop-exit", loop)
+
+            ctx.stop = stop
+
+
+        def _is_target(item) -> bool:
+            name = getattr(item, "originalname", None)
+            if name == DEFERRAL:
+                return item.nodeid.endswith("[live]")
+            return name == SHUTDOWN and "ctx" in getattr(item, "funcargs", {})
+
+
+        @pytest.hookimpl(hookwrapper=True)
+        def pytest_runtest_call(item):
+            if not _is_target(item):
+                yield
+                return
+            target = Target(item.nodeid)
+            restore = None
+            try:
+                if getattr(item, "originalname", None) == DEFERRAL:
+                    module = item.module
+                    original = module.wait_for_condition
+                    module.wait_for_condition = _wrap_wait(original, target)
+                    restore = lambda: setattr(module, "wait_for_condition", original)  # noqa: E731
+                else:
+                    _wrap_stop(item.funcargs["ctx"], target)
+            except Exception as error:  # noqa: BLE001
+                ERRORS.append(f"{item.nodeid}: wrap failed: {type(error).__name__}: {error}")
+            watchdog = Watchdog(threading.get_ident())
+            target.mark("call-start")
+            watchdog.start()
+            outcome = None
+            try:
+                outcome = yield
+            finally:
+                joined = watchdog.stop()
+                target.mark("call-end")
+                if restore is not None:
+                    restore()
+                samples = list(watchdog.samples)
+                excinfo = getattr(outcome, "excinfo", None)
+                target.record.update({
+                    "outcome": "failed" if excinfo else "passed",
+                    "error": None if not excinfo else f"{excinfo[0].__name__}: {str(excinfo[1])[:300]}",
+                    "watchdog_joined": joined,
+                    "watchdog_alive_after": any(t.name == WATCHDOG_NAME and t.is_alive() for t in threading.enumerate()),
+                    "dropped": watchdog.dropped,
+                    "observer_errors": watchdog.errors,
+                    "max_gap_s": max((s["gap"] for s in samples), default=None),
+                    "held_runs": held_runs(samples),
+                    "samples": samples,
+                })
+                if not joined or watchdog.errors:
+                    ERRORS.append(f"{item.nodeid}: watchdog joined={joined} errors={watchdog.errors}")
+                RECORDS.append(target.record)
+
+
+        def pytest_terminal_summary(terminalreporter):
+            if not RECORDS and not ERRORS:
+                return
+            terminalreporter.write_sep("=", "U2D WATCHDOG OBSERVER")
+            for error in ERRORS:
+                terminalreporter.write_line("U2D_OBSERVER_ERROR " + error)
+            for record in RECORDS:
+                terminalreporter.write_line("U2D_TARGET " + json.dumps(record, sort_keys=True))
+            out = os.environ.get("U2D_OBSERVER_OUT")
+            if out:
+                with open(out, "a", encoding="utf-8") as handle:
+                    for record in RECORDS:
+                        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        PY
+        {
+          echo "PYTHONPATH=$RUNNER_TEMP"
+          echo "PYTEST_PLUGINS=u2d_watchdog_observer"
+          echo "U2D_OBSERVER_OUT=$RUNNER_TEMP/u2d-watchdog.jsonl"
+        } >> "$GITHUB_ENV"
+
     - name: Run tests
       run: uv run --all-packages pytest
 
