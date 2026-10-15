@@ -95,6 +95,296 @@ jobs:
     - name: Collect baseline E2E in the core environment
       run: uv run --all-packages pytest tests/e2e/baseline/ --collect-only -q --no-cov
 
+    - name: Install temporary U2D fault capture (diagnostic only)
+      if: matrix.os == 'ubuntu-latest' && (matrix.python-version == '3.11' || matrix.python-version == '3.12')
+      run: |
+        mkdir -p "$RUNNER_TEMP/u2d-capture"
+        cat > "$RUNNER_TEMP/u2d_fault_capture.py" <<'PY'
+        """Diagnostic-only pytest plugin (fork CI only): C-level stack capture at two boundaries.
+
+        faulthandler.dump_traceback_later(0.25, repeat=True, exit=False) is armed only
+        around (1) the deferral [live] target's first wait_for_condition, the initial-A
+        wait, and (2) the shutdown target's measured ctx.stop(). Each arm writes to its
+        own retained file; the watchdog is cancelled in ``finally`` before the file is
+        closed. The faulthandler watchdog is a C thread: it dumps every thread's Python
+        stack even while the main thread holds the GIL. Dumps are Python stacks, not C
+        backtraces; host-wide descheduling of the whole process stays unobservable.
+
+        Each boundary records monotonic wall time, main-thread CPU (time.thread_time on
+        the main thread) and loop time. On an initial-A timeout the test's peer, adapter
+        and execution-context state plus every task's await chain are captured before
+        the failure propagates to the test's cleanup; after a slow (>= 0.5 loop s) or
+        raising stop the same task/context state is captured. Failures and assertions
+        are never suppressed or changed.
+
+        Not armed if pytest's own faulthandler_timeout is configured, because
+        faulthandler has a single process-wide watchdog; that is reported as an
+        observer error instead. No loop timers, clock patches, GC or logging changes.
+        """
+
+        from __future__ import annotations
+
+        import asyncio
+        import collections
+        import faulthandler
+        import functools
+        import json
+        import os
+        import sys
+        import threading
+        import time
+
+        import pytest
+
+        DEFERRAL = "test_approval_beyond_first_page_releases_ordered_work"
+        SHUTDOWN = "test_stop_returns_quickly_when_idle"
+        DUMP_INTERVAL_S = 0.25
+        SLOW_STOP_S = 0.5
+        RECORDS: list[dict] = []
+        ERRORS: list[str] = []
+        CONFIG = None
+
+
+        def _capture_dir() -> str:
+            path = os.environ.get("U2D_CAPTURE_DIR") or os.path.join(os.getcwd(), "u2d-capture")
+            os.makedirs(path, exist_ok=True)
+            return path
+
+
+        def _tag() -> str:
+            return f"py{sys.version_info.major}.{sys.version_info.minor}"
+
+
+        def _mark(record: dict, label: str, loop=None) -> None:
+            event = {"label": label, "wall": time.monotonic(), "main_thread_cpu": time.thread_time()}
+            if loop is not None and not loop.is_closed():
+                event["loop_time"] = loop.time()
+            record["events"].append(event)
+
+
+        def _await_chain(awaitable) -> list:
+            chain, seen = [], set()
+            while awaitable is not None and id(awaitable) not in seen and len(chain) < 64:
+                seen.add(id(awaitable))
+                frame = getattr(awaitable, "cr_frame", None) or getattr(awaitable, "gi_frame", None) or getattr(awaitable, "ag_frame", None)
+                if frame is None:
+                    chain.append({"awaiting": type(awaitable).__qualname__})
+                    break
+                chain.append([frame.f_code.co_filename, frame.f_code.co_name, frame.f_lineno])
+                awaitable = getattr(awaitable, "cr_await", None) or getattr(awaitable, "gi_yieldfrom", None) or getattr(awaitable, "ag_await", None)
+            return chain
+
+
+        def _task(task) -> dict:
+            waiter = getattr(task, "_fut_waiter", None)
+            return {
+                "name": task.get_name(), "done": task.done(),
+                "cancelled": task.cancelled() if task.done() else None,
+                "cancelling": task.cancelling() if hasattr(task, "cancelling") else None,
+                "chain": [] if task.done() else _await_chain(task.get_coro()),
+                "fut_waiter": None if waiter is None else repr(waiter)[:300],
+            }
+
+
+        def _value(value):
+            if isinstance(value, (bool, int, float, str)) or value is None:
+                return value
+            if isinstance(value, asyncio.Task):
+                return {"task": _task(value)}
+            if isinstance(value, asyncio.Event):
+                return {"event_set": value.is_set()}
+            if isinstance(value, (list, tuple, set, frozenset, collections.deque)):
+                items = list(value)
+                if all(isinstance(i, (str, int, float, bool)) or i is None for i in items):
+                    return items[-50:]
+                if all(isinstance(i, tuple) and all(isinstance(x, (str, int, float, bool)) or x is None for x in i) for i in items):
+                    return [list(i) for i in items[-50:]]
+                return {"type": type(value).__name__, "len": len(items)}
+            if isinstance(value, dict):
+                if any(isinstance(k, asyncio.Task) for k in value):
+                    return {"tasks": [_task(k) for k in value][:20]}
+                return {"type": "dict", "len": len(value)}
+            return {"type": type(value).__qualname__}
+
+
+        def _object_state(obj) -> dict:
+            return {name: _value(value) for name, value in sorted(vars(obj).items())}
+
+
+        def _loop_state(loop) -> dict:
+            now = loop.time()
+            timers = sorted(
+                ({"in_s": round(h.when() - now, 6), "cancelled": h.cancelled(), "callback": repr(getattr(h, "_callback", None))[:200]} for h in getattr(loop, "_scheduled", ())),
+                key=lambda t: t["in_s"],
+            )
+            return {
+                "tasks": [_task(t) for t in asyncio.all_tasks(loop)],
+                "timers": timers[:60], "timer_count": len(timers),
+                "ready": [repr(getattr(h, "_callback", None))[:200] for h in list(getattr(loop, "_ready", ()))],
+            }
+
+
+        def _ctx_state(ctx) -> dict:
+            state = _object_state(ctx)
+            try:
+                cycle = ctx._active_cycle_task
+                state["_active_cycle_task"] = None if cycle is None else {"task": _task(cycle)}
+            except Exception as error:  # noqa: BLE001 - diagnostic read only
+                state["_active_cycle_task"] = f"unreadable: {type(error).__name__}"
+            return state
+
+
+        class Arm:
+            """One faulthandler watchdog arm writing to its own retained file."""
+
+            def __init__(self, record: dict, boundary: str) -> None:
+                safe = "".join(c if c.isalnum() or c in "-_." else "-" for c in record["node"]).strip("-")
+                self.path = os.path.join(_capture_dir(), f"{_tag()}-{safe}-{boundary}.dump")
+                self.record = record
+                self.file = None
+
+            def __enter__(self):
+                if CONFIG is not None and float(CONFIG.getini("faulthandler_timeout") or 0) > 0:
+                    ERRORS.append(f"{self.record['node']}: pytest faulthandler_timeout owns the watchdog; not armed")
+                    return self
+                self.file = open(self.path, "w", encoding="utf-8")  # noqa: SIM115 - lifetime spans the arm
+                faulthandler.dump_traceback_later(DUMP_INTERVAL_S, repeat=True, file=self.file, exit=False)
+                self.record["dump_file"] = os.path.basename(self.path)
+                return self
+
+            def __exit__(self, *exc) -> None:
+                if self.file is None:
+                    return
+                faulthandler.cancel_dump_traceback_later()
+                self.file.flush()
+                self.file.close()
+                self.record["dump_bytes_at_disarm"] = os.path.getsize(self.path)
+
+
+        def _wrap_wait(original, record: dict):
+            calls = {"n": 0}
+
+            @functools.wraps(original)
+            async def wait_for_condition(*args, **kwargs):
+                calls["n"] += 1
+                if calls["n"] != 1:
+                    return await original(*args, **kwargs)
+                loop = asyncio.get_running_loop()
+                caller = sys._getframe(0).f_back
+                _mark(record, "initialA-enter", loop)
+                try:
+                    with Arm(record, "initialA"):
+                        result = await original(*args, **kwargs)
+                except pytest.fail.Exception:
+                    _mark(record, "initialA-timeout", loop)
+                    scope = caller.f_locals if caller is not None else {}
+                    record["timeout_state"] = {
+                        "caller": None if caller is None else [caller.f_code.co_name, caller.f_lineno],
+                        "peer": _object_state(scope["peer"]) if "peer" in scope else None,
+                        "adapter": _object_state(scope["adapter"]) if "adapter" in scope else None,
+                        "ctx": _ctx_state(scope["ctx"]) if "ctx" in scope else None,
+                        "loop": _loop_state(loop),
+                    }
+                    raise
+                _mark(record, "initialA-return", loop)
+                return result
+
+            return wait_for_condition
+
+
+        def _wrap_stop(ctx, record: dict) -> None:
+            original = ctx.stop
+            calls = {"n": 0}
+
+            async def stop(*args, **kwargs):
+                calls["n"] += 1
+                if calls["n"] != 1:
+                    return await original(*args, **kwargs)
+                loop = asyncio.get_running_loop()
+                _mark(record, "stop-enter", loop)
+                raised = None
+                try:
+                    with Arm(record, "stop"):
+                        return await original(*args, **kwargs)
+                except BaseException as error:
+                    raised = error
+                    raise
+                finally:
+                    _mark(record, "stop-exit", loop)
+                    enter, leave = record["events"][-2], record["events"][-1]
+                    if raised is not None or leave["loop_time"] - enter["loop_time"] >= SLOW_STOP_S:
+                        record["after_stop_state"] = {
+                            "raised": None if raised is None else type(raised).__name__,
+                            "ctx": _ctx_state(ctx), "loop": _loop_state(loop),
+                        }
+
+            ctx.stop = stop
+
+
+        def pytest_configure(config) -> None:
+            global CONFIG
+            CONFIG = config
+
+
+        @pytest.hookimpl(hookwrapper=True)
+        def pytest_runtest_call(item):
+            name = getattr(item, "originalname", None)
+            record = None
+            restore = None
+            try:
+                if name == DEFERRAL and item.nodeid.endswith("[live]"):
+                    record = {"node": item.nodeid, "events": []}
+                    module = item.module
+                    original = module.wait_for_condition
+                    module.wait_for_condition = _wrap_wait(original, record)
+                    restore = lambda: setattr(module, "wait_for_condition", original)  # noqa: E731
+                elif name == SHUTDOWN and "ctx" in getattr(item, "funcargs", {}):
+                    record = {"node": item.nodeid, "events": []}
+                    ctx = item.funcargs["ctx"]
+                    _wrap_stop(ctx, record)
+                    restore = lambda: ctx.__dict__.pop("stop", None)  # noqa: E731
+            except Exception as error:  # noqa: BLE001
+                ERRORS.append(f"{item.nodeid}: wrap failed: {type(error).__name__}: {error}")
+            if record is not None:
+                _mark(record, "call-start")
+            outcome = yield
+            if record is None:
+                return
+            _mark(record, "call-end")
+            if restore is not None:
+                restore()
+            excinfo = getattr(outcome, "excinfo", None)
+            record["outcome"] = "failed" if excinfo else "passed"
+            record["error"] = None if not excinfo else f"{excinfo[0].__name__}: {str(excinfo[1])[:400]}"
+            record["threads_after"] = sorted(t.name for t in threading.enumerate())
+            RECORDS.append(record)
+
+
+        def pytest_terminal_summary(terminalreporter):
+            if not RECORDS and not ERRORS:
+                return
+            terminalreporter.write_sep("=", "U2D FAULT CAPTURE")
+            for error in ERRORS:
+                terminalreporter.write_line("U2D_CAPTURE_ERROR " + error)
+            out = os.path.join(_capture_dir(), f"{_tag()}-records.jsonl")
+            with open(out, "a", encoding="utf-8") as handle:
+                for record in RECORDS:
+                    line = json.dumps(record, sort_keys=True, default=repr)
+                    handle.write(line + "\n")
+                    terminalreporter.write_line("U2D_CAPTURE " + line)
+            for record in RECORDS:
+                dump = record.get("dump_file")
+                if dump and record.get("dump_bytes_at_disarm"):
+                    with open(os.path.join(_capture_dir(), dump), encoding="utf-8", errors="replace") as handle:
+                        for line in handle:
+                            terminalreporter.write_line(f"U2D_DUMP {dump} {line.rstrip()}")
+        PY
+        {
+          echo "PYTHONPATH=$RUNNER_TEMP"
+          echo "PYTEST_PLUGINS=u2d_fault_capture"
+          echo "U2D_CAPTURE_DIR=$RUNNER_TEMP/u2d-capture"
+        } >> "$GITHUB_ENV"
+
     - name: Run tests
       run: uv run --all-packages pytest
 
@@ -106,6 +396,15 @@ jobs:
       run: |
         # shellcheck disable=SC2046  # word-splitting the ls-files output is the point
         uv run --all-packages pytest --markdown-docs $(git ls-files '*.md' ':!:examples/*' ':!:docs/adapters/nooa.md') --no-cov
+
+    - name: Retain U2D fault capture (diagnostic only)
+      if: always() && matrix.os == 'ubuntu-latest' && (matrix.python-version == '3.11' || matrix.python-version == '3.12')
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: u2d-capture-${{ matrix.python-version }}
+        path: ${{ runner.temp }}/u2d-capture
+        if-no-files-found: warn
+        retention-days: 7
 
 
   test-crewai:
