@@ -95,6 +95,20 @@ jobs:
     - name: Collect baseline E2E in the core environment
       run: uv run --all-packages pytest tests/e2e/baseline/ --collect-only -q --no-cov
 
+    - name: Install temporary U2D GC observer (diagnostic only)
+      if: matrix.os == 'ubuntu-latest' && (matrix.python-version == '3.11' || matrix.python-version == '3.12')
+      env:
+        U2D_PYTHON: ${{ matrix.python-version }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/u2d-gc"
+        cp .github/scripts/u2d_gc_observer.py "$RUNNER_TEMP/u2d_gc_observer.py"
+        sha256sum .github/scripts/u2d_gc_observer.py "$RUNNER_TEMP/u2d_gc_observer.py"
+        {
+          echo "PYTHONPATH=$RUNNER_TEMP"
+          echo "PYTEST_PLUGINS=u2d_gc_observer"
+          echo "U2D_GC_OUT=$RUNNER_TEMP/u2d-gc/records-$U2D_PYTHON.txt"
+        } >> "$GITHUB_ENV"
+
     - name: Run tests
       run: uv run --all-packages pytest
 
@@ -106,6 +120,15 @@ jobs:
       run: |
         # shellcheck disable=SC2046  # word-splitting the ls-files output is the point
         uv run --all-packages pytest --markdown-docs $(git ls-files '*.md' ':!:examples/*' ':!:docs/adapters/nooa.md') --no-cov
+
+    - name: Retain U2D GC observer records (diagnostic only)
+      if: always() && matrix.os == 'ubuntu-latest' && (matrix.python-version == '3.11' || matrix.python-version == '3.12')
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: u2d-gc-${{ matrix.python-version }}
+        path: ${{ runner.temp }}/u2d-gc
+        if-no-files-found: warn
+        retention-days: 7
 
 
   test-crewai:
