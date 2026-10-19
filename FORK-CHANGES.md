@@ -34,6 +34,8 @@ Copilot/ACP #853 replaces #799, native OMP #854 replaces #798, Codex #855
 replaces #797, and Claude #856 replaces #800. Native OMP follows #763; Claude
 follows #855. All corrections stay in those source branches, not in generated
 SDK commits.
+Backlog recovery #857 likewise replaces #730 without changing its source head.
+Every selected upstream pull request is maintained from this fork.
 
 Native OMP catalogs (#848) use `after 763`: their branch inherits the native
 adapter and transplanted copies of #844's shared changes, not #844's head.
