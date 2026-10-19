@@ -7,7 +7,7 @@ import json
 import logging
 import time as _time
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, fields
@@ -15,7 +15,7 @@ from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from enum import StrEnum
 from functools import partial
-from typing import Any, ClassVar, Literal, NamedTuple, Protocol
+from typing import Any, ClassVar, Literal, NamedTuple, Protocol, TypeVar
 
 from band_sdk_core import AgentFailure
 from pydantic import (
@@ -36,6 +36,7 @@ from typing_extensions import Unpack
 
 from band.converters.codex import CodexHistoryConverter
 from band.converters.helpers import build_replay_messages
+from band.core import exceptions, harness
 from band.core.adapterconfig import EnvAdapterConfig
 from band.core.content import has_visible_content
 from band.core.defaultmodels import OPENAI_MODEL
@@ -107,6 +108,7 @@ from band.integrations.codex.types import (
     build_agent_failure,
     parse_plan_steps,
 )
+from band.integrations.codex.winspawn import MISSING_EXECUTABLE, SpawnFailure
 from band.runtime.custom_tools import (
     CustomToolDef,
     custom_tool_to_openai_schema,
@@ -135,6 +137,8 @@ from band.workspaces import (
 )
 
 logger = logging.getLogger(__name__)
+
+_ProbeResult = TypeVar("_ProbeResult")
 
 
 def _image_content_items(result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1971,9 +1975,10 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
                 raise
 
     async def cleanup_all(self) -> None:
-        """Stop the residency owner: admission closes at once, every room's
-        turn gets ``turn_settle_timeout_s`` to wind down, then its process
-        closes, all reported within one ``retention.transition_timeout_s``.
+        """Stop every room and any standalone probe, attempting both on failure.
+
+        Rooms share ``retention.transition_timeout_s``; probe cleanup keeps its
+        independent budget and custody until the transport physically exits.
 
         Callers join the same stop, and a failed one is retried. An unfinished
         or failed stop keeps every room fenced with its process, thread and
@@ -1989,7 +1994,17 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
                     reason=f"Room {room_id} acquisition was cancelled for cleanup",
                 )
             self._clear_pending_approvals_for_room(room_id)
-        await self._retention.stop()
+        failures: list[BaseException] = []
+        # Retention must see an enrolled callback as the stop requester.
+        for cleanup in (self._retention.stop, super().cleanup_all):
+            try:
+                await cleanup()
+            except BaseException as error:  # noqa: BLE001 -- attempt both cleanups before propagating cancellation or failures
+                failures.append(error)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("Codex adapter cleanup failed", failures)
 
     @staticmethod
     def _check_startup_current(room: RoomCodexClient, generation: int) -> None:
@@ -2380,6 +2395,74 @@ class CodexAdapter(ApprovalInterruptMixin, SimpleAdapter[CodexSessionState]):
         self._needs_history_injection.discard(room_id)
         self._raw_history_by_room.pop(room_id, None)
         return thread_id
+
+    async def preflight(self, *, timeout_s: float = 60.0) -> harness.PreflightResult:
+        """Check the configured app-server and its reported login without a turn."""
+        try:
+            return await self._probe_harness(self._login_state, timeout_s=timeout_s)
+        except exceptions.CleanupIncompleteError:
+            raise
+        except exceptions.BandConnectionError as error:
+            cause = error.__cause__
+            if isinstance(cause, FileNotFoundError) or (
+                isinstance(cause, SpawnFailure) and cause.winerror in MISSING_EXECUTABLE
+            ):
+                return harness.PreflightResult.failed(
+                    "Codex CLI binary not found.",
+                    "Install Codex (`npm install -g @openai/codex`) or set "
+                    "CodexAdapterConfig.codex_command.",
+                )
+            return self._handshake_failed()
+        except Exception:  # noqa: BLE001 -- ordinary probe failures are safe host-facing results
+            return self._handshake_failed()
+
+    @staticmethod
+    def _handshake_failed() -> harness.PreflightResult:
+        return harness.PreflightResult.failed(
+            "Codex app-server did not complete its handshake.",
+            "Run `codex app-server` in a terminal to check the install, then retry.",
+        )
+
+    @staticmethod
+    async def _login_state(client: CodexClientProtocol) -> harness.PreflightResult:
+        try:
+            account = await client.request(CodexRequestMethod.ACCOUNT_READ, {})
+        except CodexJsonRpcError:
+            # Unsupported or refused metadata is not evidence of a missing login.
+            return harness.PreflightResult.passed()
+        if account.get("account") is None and account.get("requiresOpenaiAuth") is True:
+            return harness.PreflightResult.failed(
+                "Codex is not logged in.", "Run `codex login`, then retry."
+            )
+        return harness.PreflightResult.passed()
+
+    async def _probe_harness(
+        self,
+        operation: Callable[[CodexClientProtocol], Awaitable[_ProbeResult]],
+        *,
+        timeout_s: float,
+    ) -> _ProbeResult:
+        async def inspect() -> _ProbeResult:
+            client = CodexStdioClient(
+                command=self.config.codex_command,
+                env=self.config.codex_env,
+                graceful_shutdown=False,
+            )
+            self._harness_probe.own(client.close)
+            await client.connect()
+            await self._initialize_probe(client)
+            return await operation(client)
+
+        return await self._harness_probe.run(inspect, timeout_s=timeout_s)
+
+    async def _initialize_probe(self, client: CodexClientProtocol) -> None:
+        await client.initialize(
+            client_name=self.config.client_name,
+            client_title=self.config.client_title,
+            client_version=self.config.client_version,
+            experimental_api=self.config.experimental_api,
+        )
+        await self._register_skill_roots(client)
 
     async def _register_skill_roots(self, client: CodexClientProtocol) -> None:
         roots = self.config.skill_roots

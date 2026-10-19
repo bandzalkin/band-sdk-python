@@ -97,7 +97,7 @@ async def _wait_readers(readers: Sequence[asyncio.Task[None]]) -> None:
         return
     _done, pending = await asyncio.wait(readers, timeout=_EXIT_OBSERVE_S)
     if pending:
-        logger.warning("Codex stdio readers still pending after tree kill")
+        raise TimeoutError("Codex stdio readers still pending after tree kill")
 
 
 async def _wait_for_process_group_exit(pgid: int) -> bool:
@@ -150,11 +150,17 @@ async def kill_process_tree(process: asyncio.subprocess.Process) -> None:
 
 
 class CodexStdioClient(BaseJsonRpcClient):
-    """Bidirectional JSON-RPC client with a single stdout read loop."""
+    """Bidirectional JSON-RPC client with a single stdout read loop.
+
+    Transport logs report metadata only; callers still receive original errors.
+    ``graceful_shutdown=False`` requests immediate owned POSIX termination before
+    ordinary settlement; the default leaves that settlement policy unchanged.
+    """
 
     def __init__(
         self,
         *,
+        graceful_shutdown: bool = True,
         command: Sequence[str] | None = None,
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
@@ -175,6 +181,8 @@ class CodexStdioClient(BaseJsonRpcClient):
 
         self._proc: asyncio.subprocess.Process | None = None
         self._windows_process: WindowsProcess | None = None
+        self._creation_task: asyncio.Task[None] | None = None
+        self._graceful_shutdown = graceful_shutdown
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
@@ -196,6 +204,7 @@ class CodexStdioClient(BaseJsonRpcClient):
         if self._close_task is not None:
             await self.close()
             self._close_task = None
+            self._creation_task = None
         if self._connected:
             return
 
@@ -224,8 +233,24 @@ class CodexStdioClient(BaseJsonRpcClient):
             except BaseException:
                 await self.close()
                 raise
+        if self._creation_task is not None:
+            raise BandConnectionError("Codex process is already starting")
+        self._creation_task = asyncio.create_task(self._create_process())
+        try:
+            # A cancelled caller cannot discard a child created before the
+            # subprocess coroutine returns its Process handle.
+            await asyncio.shield(self._creation_task)
+            if self._close_task is not None:
+                raise BandConnectionError("Codex process closed during startup")
+            assert self._proc is not None
+            return self._proc
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _create_process(self) -> None:
         # The child leads its own session, so its pid is the group id.
-        return await asyncio.create_subprocess_exec(
+        self._proc = await asyncio.create_subprocess_exec(
             *self.command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -262,7 +287,11 @@ class CodexStdioClient(BaseJsonRpcClient):
 
     async def close(self) -> None:
         """Share retryable cleanup that survives a cancelled or timed-out caller."""
-        if self._windows_process is None and self._proc is None:
+        if (
+            self._windows_process is None
+            and self._proc is None
+            and self._creation_task is None
+        ):
             return
         if self._windows_process is not None:
             self._windows_process.closing = True
@@ -284,12 +313,34 @@ class CodexStdioClient(BaseJsonRpcClient):
             )
 
     async def _close_process(self) -> None:
+        await self._settle_process()
+        if self._proc is not None and self._proc.returncode is None:
+            raise TimeoutError(
+                f"Codex process {self._proc.pid} still alive after tree kill"
+            )
+
+    async def _settle_process(self) -> None:
         readers = [
             task for task in (self._reader_task, self._stderr_task) if task is not None
         ]
         for task in readers:
             task.cancel()
         try:
+            if self._creation_task is not None:
+                done, _pending = await asyncio.wait(
+                    [self._creation_task], timeout=_EXIT_OBSERVE_S
+                )
+                if not done:
+                    raise TimeoutError("Codex process creation is still pending")
+                if not self._creation_task.cancelled():
+                    self._creation_task.exception()
+            if (
+                not self._graceful_shutdown
+                and os.name != "nt"
+                and (process := self._proc) is not None
+            ):
+                await close_stdin(process)
+                await kill_process_tree(process)
             # A cancelled pipe read on Windows stays pending while the child is
             # blocked in a synchronous stdin read, and awaiting that read never
             # times out. Terminate the tree and close our write end first.
@@ -334,8 +385,8 @@ class CodexStdioClient(BaseJsonRpcClient):
                 await self._dispatch_rpc_message(line.decode("utf-8", errors="replace"))
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("Codex stdout loop failed")
+        except Exception:  # noqa: BLE001 -- fail pending RPCs without logging sensitive exception text
+            logger.error("Codex stdout loop failed")
             self._fail_pending("Codex stdout loop failed")
 
     async def _read_stderr_loop(self) -> None:
@@ -350,5 +401,5 @@ class CodexStdioClient(BaseJsonRpcClient):
                     logger.debug("codex stderr (type=bytes, length=%d)", len(line))
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("Codex stderr loop failed")
+        except Exception:  # noqa: BLE001 -- contain reader faults without logging sensitive exception text
+            logger.error("Codex stderr loop failed")
