@@ -23,6 +23,18 @@ replay workflow). Nothing else.
 `N after M` marks N as stacked on M: while M is open, only N's own changes on top of
 M's head are applied.
 
+The selection includes native OMP room asks (#795) and the refreshed host APIs
+(#843–#852), alongside the existing backlog, native OMP and room-scoped MCP fixes.
+Host status (#849) follows disconnect reporting (#843). Shared probe contracts
+(#844) precede the backend preflights and catalogs; Claude and Codex catalogs
+(#851/#852) follow their preflights (#847/#846).
+
+Native OMP catalogs (#848) use `after 763`: their branch inherits the native
+adapter and transplanted copies of #844's shared changes, not #844's head.
+Identical shared, Windows Job and ACP cleanup corrections carried by multiple
+selected pull requests must compose once in the resulting tree. Any disagreement
+is corrected in the owning upstream pull request, not with a fork patch.
+
 Every day at 06:17 UTC (or on a manual dispatch) `.github/workflows/band-agent-replay.yml`
 runs `.github/band-agent/replay.py`, which:
 
