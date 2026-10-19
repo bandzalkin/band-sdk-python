@@ -14,6 +14,7 @@ from band.client.rest import AsyncRestClient
 from band.client.streaming import ControlMode
 from band.core.exceptions import BandConfigError, InputNotAccepted
 from band.core.handoff import context_handoff
+from band.core.harness import HarnessProbe, PreflightResult
 from band.core.model_catalog import (
     ModelCatalog,
     ModelSelection,
@@ -137,6 +138,7 @@ class SimpleAdapter(ABC, Generic[H]):
         # platform access read it via require_platform().
         self.platform: PlatformConnection | None = None
         self.features = self._resolve_features(**features)
+        self._harness_probe_owner: HarnessProbe | None = None
 
     def _resolve_features(
         self,
@@ -310,6 +312,8 @@ class SimpleAdapter(ABC, Generic[H]):
         runtime subprocess, a self-hosted server, an external registration —
         release here.
         """
+        if self._harness_probe_owner is not None:
+            await self._harness_probe_owner.close()
 
     @property
     def model_selection(self) -> ModelSelection:
@@ -330,6 +334,35 @@ class SimpleAdapter(ABC, Generic[H]):
         selection per session instead.
         """
         return None
+
+    @property
+    def _harness_probe(self) -> HarnessProbe:
+        if self._harness_probe_owner is None:
+            self._harness_probe_owner = HarnessProbe()
+        return self._harness_probe_owner
+
+    async def preflight(self, *, timeout_s: float = 60.0) -> PreflightResult:
+        """Check a throwaway harness handshake without starting a Band room.
+
+        A passed handshake does not prove provider authentication or inference
+        access. Cleanup failures propagate and stay owned for ``cleanup_all``.
+        """
+        del timeout_s
+        return PreflightResult.failed(
+            f"{type(self).__name__} does not support harness preflight.",
+            "Use the harness's own startup check.",
+        )
+
+    async def probe_models(self, *, timeout_s: float = 60.0) -> ModelCatalog:
+        """Discover models without using or creating a Band room.
+
+        Unlike ``list_models``, this explicit host operation may start a
+        throwaway transport. Cleanup failures remain owned by this adapter.
+        """
+        del timeout_s
+        raise BandConfigError(
+            f"{type(self).__name__} does not support standalone model discovery"
+        )
 
     async def apply_model_selection(
         self, selection: ModelSelection, *, room_id: str
