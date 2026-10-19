@@ -29,6 +29,12 @@ Host status (#849) follows disconnect reporting (#843). Shared probe contracts
 (#844) precede the backend preflights and catalogs; Claude and Codex catalogs
 (#851/#852) follow their preflights (#847/#846).
 
+Room-scoped MCP startup is maintained in fork-backed upstream pull requests:
+Copilot/ACP #853 replaces #799, native OMP #854 replaces #798, Codex #855
+replaces #797, and Claude #856 replaces #800. Native OMP follows #763; Claude
+follows #855. All corrections stay in those source branches, not in generated
+SDK commits.
+
 Native OMP catalogs (#848) use `after 763`: their branch inherits the native
 adapter and transplanted copies of #844's shared changes, not #844's head.
 Identical shared, Windows Job and ACP cleanup corrections carried by multiple
