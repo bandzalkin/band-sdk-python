@@ -48,7 +48,6 @@ class TestProcessClosure:
                 stage,
                 [],
                 orphan_pid_file=holder_pid_file,
-                retention=RoomRetentionConfig(transition_timeout_s=2.0),
                 # A held stdout hides the agent's death, so its prompt only ends
                 # at the turn deadline, whose recovery then waits on the pipes.
                 turn_timeout_s=1.0,
@@ -59,6 +58,12 @@ class TestProcessClosure:
         try:
             with nullcontext() if turn_error is None else pytest.raises(turn_error):
                 await send_to(adapter, DEFAULT_ROOM)
+            # Bound pipe closure separately from the peer's cold-start imports.
+            monkeypatch.setattr(
+                adapter._retention,
+                "config",
+                RoomRetentionConfig(transition_timeout_s=2.0),
+            )
             room = adapter._rooms[DEFAULT_ROOM]
             runtime = room.runtime
             assert runtime is not None
