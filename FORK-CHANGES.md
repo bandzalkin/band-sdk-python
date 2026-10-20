@@ -34,8 +34,17 @@ Copilot/ACP #853 replaces #799, native OMP #854 replaces #798, Codex #855
 replaces #797, and Claude #856 replaces #800. Native OMP follows #763; Claude
 follows #855. All corrections stay in those source branches, not in generated
 SDK commits.
-Backlog recovery #857 likewise replaces #730 without changing its source head.
+Backlog recovery #857 likewise replaces #730; its source branch was rebased
+onto current `main` on 2026-10-20 after the test reorg moved its files.
 Every selected upstream pull request is maintained from this fork.
+
+The typed agent activity stack (Band's INT-1744) is carried through #841,
+whose branch inherits the merged #839 and the #840 delivery work, with our
+#874 stacked after #841: it gates tool names in the activity detail on the
+adapter's tool-narration choice, pending the producers adopting the same
+rule. Because #763 deletes `omp_acp.py` while #841 edits it, #763 lists
+`after 874` so its removal composes once, and #880 (activity hooks for the
+native OMP adapter, which the stack does not cover) follows #763.
 
 Native OMP catalogs (#848) use `after 763`: their branch inherits the native
 adapter and transplanted copies of #844's shared changes, not #844's head.
