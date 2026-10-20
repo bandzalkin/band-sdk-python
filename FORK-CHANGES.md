@@ -43,8 +43,8 @@ whose branch inherits the merged #839 and the #840 delivery work, with our
 #874 stacked after #841: it gates tool names in the activity detail on the
 adapter's tool-narration choice, pending the producers adopting the same
 rule. Because #763 deletes `omp_acp.py` while #841 edits it, #763 lists
-`after 874` so its removal composes once, and #880 (activity hooks for the
-native OMP adapter, which the stack does not cover) follows #763.
+`after 874` so its removal composes once; the native OMP activity hooks
+(tool and permission) land on #763's own branch.
 
 Native OMP catalogs (#848) use `after 763`: their branch inherits the native
 adapter and transplanted copies of #844's shared changes, not #844's head.
