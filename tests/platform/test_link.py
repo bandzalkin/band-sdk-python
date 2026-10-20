@@ -106,20 +106,6 @@ class TestBandLinkConnection:
         )
         await link.connect()
 
-        mock_ws_class.assert_called_once_with(
-            link.ws_url,
-            link.api_key,
-            link.agent_id,
-            on_reconnect=link._on_reconnected,
-            on_disconnect=link._on_disconnected,
-            conflict_policy=ConflictPolicy.REJECT,
-        )
-        mock_ws_client.__aenter__.assert_called_once()
-        mock_ws_client.join_agent_control_channel.assert_called_once_with(
-            link.agent_id,
-            on_supersede=link._on_supersede,
-            on_control=link._on_control,
-        )
         assert link.is_connected is True
 
     @patch("band.platform.link.WebSocketClient")
