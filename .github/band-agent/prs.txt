@@ -1,12 +1,10 @@
 # Our open upstream pull requests (band-ai/band-sdk-python), applied in this order
 # at their current heads. "N after M" marks N as stacked on M: while M is open, only
 # N's own changes on top of M are applied.
-#
-# #841 (activity producers) no longer applies to upstream main until its author
-# rebases it; #902 carries #841 resolved against current main plus #901's gate, so
-# both come back here as "841" and "901 after 841" once #841 is rebased.
+901
 893
 894
+905
 895
 896
 897
