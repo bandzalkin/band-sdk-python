@@ -37,6 +37,7 @@ async def execution(
 
         def create(
             handler: Callable[[ExecutionContext, PlatformEvent], Awaitable[None]],
+            hub_room_id: str | None = None,
             *,
             on_message_control: Callable[
                 [ExecutionContext, PlatformEvent], Awaitable[bool]
@@ -54,6 +55,7 @@ async def execution(
                 link,
                 handler,
                 agent_id=AGENT_ID,
+                hub_room_id=hub_room_id,
                 on_platform_stop=runtime._on_platform_stop,
                 on_message_control=on_message_control,
                 config=SessionConfig(enable_context_hydration=False, **settings),
@@ -63,4 +65,5 @@ async def execution(
 
         yield create
         for ctx in contexts:
+            idle_report_gate.peer.activity_release.set()
             await ctx.stop()

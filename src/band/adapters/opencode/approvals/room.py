@@ -55,6 +55,7 @@ from band.integrations.opencode import (
     OpencodeQuestionRequest,
 )
 from band.runtime.decisions import DecisionEntry, DecisionRegistry
+from band.runtime.working_state import set_permission_wait
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,10 @@ class RoomApprovals:
             case "manual":
                 await self._ask_room(entry)
 
+    async def _report_manual_wait(self) -> None:
+        if tools := self._ports.tools():
+            await set_permission_wait(tools, self.awaiting_human())
+
     async def _ask_room(self, entry: DecisionEntry[PendingPermission]) -> None:
         """Park the ask on a human: post it to the room and start its expiry."""
         pending = entry.payload
@@ -164,6 +169,7 @@ class RoomApprovals:
             entry, self._config.approval_wait_timeout_s, self._expire_permission
         )
         self._human.park()
+        await self._report_manual_wait()
         pattern_text = ", ".join(pending.patterns) if pending.patterns else "n/a"
         await self._notify_room(
             APPROVAL_REQUESTED_TEMPLATE.format(
@@ -220,6 +226,7 @@ class RoomApprovals:
             entry, self._config.question_wait_timeout_s, self._expire_question
         )
         self._human.park()
+        await self._report_manual_wait()
         await self._notify_room(
             format_question_prompt(pending.questions, request_id),
             self._ports.turn_mentions(),
@@ -397,6 +404,7 @@ class RoomApprovals:
             reply,
         )
         self._forget(self._asks.permissions, entry)
+        await self._report_manual_wait()
         return True
 
     async def _reply_permission(
@@ -420,6 +428,7 @@ class RoomApprovals:
             entry.token,
         )
         self._forget(self._asks.questions, entry)
+        await self._report_manual_wait()
         return True
 
     async def _reply_question(
@@ -448,6 +457,7 @@ class RoomApprovals:
             entry.token,
         )
         self._forget(self._asks.questions, entry)
+        await self._report_manual_wait()
         return True
 
     async def _reject_question(self, pending: PendingQuestion) -> bool:
@@ -467,6 +477,7 @@ class RoomApprovals:
         # abort_session kills the whole session, so no sibling ask can be
         # answered either -- drop them all, timers included.
         self.cancel()
+        await self._report_manual_wait()
         self._ports.fail_turn(message)
         await self._ports.abort_session()
 

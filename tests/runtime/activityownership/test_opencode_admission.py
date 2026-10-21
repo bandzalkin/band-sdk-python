@@ -28,7 +28,7 @@ from tests.adapters.opencode.helpers import (
 from tests.conftest import make_message_event
 from tests.mcpbackends import backends_created_by
 from tests.runtime.activityownership.kit import HeldReplyPlatform
-from tests.runtime.helpers import AGENT_ID, ALICE, IDLE, KEEP_ALIVE, ROOM_ID
+from tests.runtime.helpers import AGENT_ID, ALICE, ROOM_ID
 
 
 class TestOpencodeAdmission:
@@ -72,12 +72,12 @@ class TestOpencodeAdmission:
                 assert activity_platform.marked("processed") == ["original"]
                 assert activity_platform.marked("failed") == []
                 assert len(client.prompt_calls) == 1
-                assert activity_platform.activity_reports == [KEEP_ALIVE]
+                assert activity_platform.working_transitions == [True]
 
                 activity_platform.release.set()
                 await turn_finished(first_turn)
                 await ctx._join_activity_completion()
-                assert activity_platform.activity_reports == [KEEP_ALIVE, IDLE]
+                assert activity_platform.working_transitions == [True, False]
 
                 await ctx._reconcile()
                 await ctx._join_activity_completion()
@@ -88,11 +88,11 @@ class TestOpencodeAdmission:
                     FIRST_ANSWER,
                     SECOND_ANSWER,
                 ]
-                assert activity_platform.activity_reports == [
-                    KEEP_ALIVE,
-                    IDLE,
-                    KEEP_ALIVE,
-                    IDLE,
+                assert activity_platform.working_transitions == [
+                    True,
+                    False,
+                    True,
+                    False,
                 ]
             finally:
                 activity_platform.release.set()

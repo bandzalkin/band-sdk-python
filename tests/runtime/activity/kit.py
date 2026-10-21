@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
@@ -12,6 +13,13 @@ from band.platform.link import BandLink
 from band.runtime.execution import ExecutionContext
 from band.runtime.runtime import AgentRuntime
 from band.runtime.sessionconfig import SessionConfig
+from band.runtime.tools.agent import AgentTools
+from band.runtime.working_state import (
+    end_tool_activity,
+    report_memory_activity,
+    report_tool_activity,
+    set_permission_wait,
+)
 from tests.runtime.helpers import (
     AGENT_ID,
     ROOM_ID,
@@ -70,3 +78,33 @@ async def activity_context(
         finally:
             peer.release.set()
             await ctx.stop()
+
+
+class DetailPeer(ActivityPeer):
+    """Capture the activity detail each report carries, alongside the base tuples."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.details: list[dict[str, object] | None] = []
+
+    def answer(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/activity"):
+            self.details.append(json.loads(request.content).get("activity"))
+        return super().answer(request)
+
+
+def reporting_handler(
+    *, tool: str | None = None, permission: bool = False, memory: bool = False
+):
+    async def handler(ctx: ExecutionContext, event: PlatformEvent) -> None:
+        tools = AgentTools.from_context(ctx)
+        if permission:
+            await set_permission_wait(tools, True)
+            await set_permission_wait(tools, False)
+        if memory:
+            await report_memory_activity(tools)
+        if tool is not None:
+            await report_tool_activity(tools, tool)
+            await end_tool_activity(tools)
+
+    return handler
