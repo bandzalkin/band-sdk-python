@@ -140,6 +140,9 @@ class Peer:
         self.tool_results: set[str] = set()
         self.ui_answered = False
         self.held: Frame | None = None
+        self.async_hint: bool | None = None
+        self.state_request_count = 0
+        self.snapshot_responses = 0
 
     def respond(self, frame: Frame, data: dict[str, JsonValue] | None = None) -> None:
         result: dict[str, JsonValue] = {
@@ -230,6 +233,16 @@ class Peer:
         self.prompt_count += 1
         self.settled = False
         if self.prompt_count > 1 or frame.message == "second":
+            if self.scenario == "late-stale-result":
+                send(
+                    {
+                        "type": "prompt_result",
+                        "id": "old-prompt",
+                        "agentInvoked": True,
+                        "status": "completed",
+                        "sessionSettled": True,
+                    }
+                )
             self.finish(frame)
             return
         match self.scenario:
@@ -310,6 +323,130 @@ class Peer:
                         "sessionSettled": True,
                     }
                 )
+            case "stale-idle-result":
+                # A fully answered, fully settled turn whose prompt_result
+                # carries a stale id: completion evidence never arrives while
+                # the native state positively reports idle.
+                self.respond(frame)
+                send({"type": "agent_start"})
+                self.end("complete")
+                send(
+                    {
+                        "type": "prompt_result",
+                        "id": "old-prompt",
+                        "agentInvoked": True,
+                        "status": "completed",
+                        "sessionSettled": True,
+                    }
+                )
+                self.settle()
+                return
+            case "lost-settlement":
+                # The correlated result arrives; the session_settled frame is
+                # lost and the snapshot reports every idle flag while
+                # isSettled stays false.
+                self.respond(frame)
+                send({"type": "agent_start"})
+                self.end("complete")
+                self.async_hint = False
+                self.result(settled=False)
+                return
+            case "silent-settled-continuation":
+                # Settlement is observed, then a yielded continuation claims
+                # background ownership; its completion settles without ever
+                # emitting another session_settled frame (it goes idle on
+                # release).
+                self.respond(frame)
+                send({"type": "agent_start"})
+                self.end("first")
+                self.settle()
+                self.settled = False  # the continuation makes the session busy
+                send({"type": "agent_start"})
+                self.end("continuation", pending=True)
+                self.result(settled=False)
+                return
+            case "drain-stubborn":
+                # A healthy answered turn whose host tool callback ignores
+                # cancellation: settlement completes, the callback never does.
+                self.respond(frame)
+                send({"type": "agent_start"})
+                send(
+                    {
+                        "type": "host_tool_call",
+                        "id": "host-stubborn",
+                        "toolCallId": "call-stubborn",
+                        "toolName": "band_chat",
+                        "arguments": {},
+                    }
+                )
+                self.end("complete")
+                self.result(settled=True)
+                self.settle()
+                return
+            case "settled-with-pending":
+                # The answer completes and the session reports settled while a
+                # background job keeps the pending flag set: settlement is
+                # contradicted by positive busy evidence in the very snapshot
+                # that would end the turn, and no frame claims completion until
+                # the job finishes.
+                self.respond(frame)
+                send({"type": "agent_start"})
+                self.end("answer")
+                self.result(settled=True)
+                self.settled = True
+                self.async_hint = True
+                return
+            case "drain-stubborn-adapter":
+                # As drain-stubborn, but the blocked callback is a custom tool
+                # the adapter executes, exercising the retirement seam itself.
+                self.respond(frame)
+                send({"type": "agent_start"})
+                send(
+                    {
+                        "type": "host_tool_call",
+                        "id": "host-hold",
+                        "toolCallId": "call-hold",
+                        "toolName": "hold",
+                        "arguments": {},
+                    }
+                )
+                self.end("complete")
+                self.result(settled=True)
+                self.settle()
+                return
+            case "drain-blocked-event":
+                # Result and settlement complete while one event callback stays
+                # undelivered, so the event drain never finishes.
+                self.respond(frame)
+                send({"type": "agent_start"})
+                self.end("complete")
+                self.result(settled=True)
+                self.settle()
+                send(
+                    {
+                        "type": "message_update",
+                        "messageId": "blocked",
+                        "message": assistant(""),
+                    }
+                )
+                return
+            case "refresh-state-silent":
+                # A fully healthy completion; the loss happens later, on the
+                # adapter-phase post-prompt refresh (state request #3).
+                self.respond(frame)
+                send({"type": "agent_start"})
+                self.end("complete")
+                self.result(settled=True)
+                self.settle()
+                return
+            case "get-state-silent":
+                # The correlated result arrives and the settlement snapshot
+                # response is lost: no completion path can observe state.
+                self.respond(frame)
+                send({"type": "agent_start"})
+                self.end("complete")
+                self.result(settled=False)
+                return
             case _:
                 pass
         self.respond(frame)
@@ -325,6 +462,11 @@ class Peer:
                         "error": "RPC frame exceeded the transport limit",
                     }
                 )
+            case "late-stale-result":
+                self.end("complete")
+                self.result(settled=True)
+                self.settle()
+                return
             case "large-image":
                 message = assistant("complete")
                 message["content"] = [
@@ -436,6 +578,15 @@ class Peer:
             case "prompt":
                 self.prompt(frame)
             case "get_state":
+                self.state_request_count += 1
+                if self.scenario == "get-state-silent":
+                    return  # every snapshot response is lost
+                if (
+                    self.scenario == "refresh-state-silent"
+                    and self.state_request_count > 2
+                ):
+                    return  # the post-completion refresh response is lost
+                self.snapshot_responses += 1
                 self.respond(
                     frame,
                     {
@@ -452,7 +603,11 @@ class Peer:
                             else {}
                         ),
                         "isStreaming": False,
-                        "hasPendingAsyncWork": not self.settled,
+                        "hasPendingAsyncWork": (
+                            not self.settled
+                            if self.async_hint is None
+                            else self.async_hint
+                        ),
                         "queuedMessageCount": 0,
                     },
                 )
@@ -461,6 +616,18 @@ class Peer:
             case "release":
                 if self.scenario == "settlement-before-result":
                     self.result(settled=False)
+                elif self.scenario == "silent-settled-continuation":
+                    # The background work completes and the session goes idle,
+                    # but its session_settled frame is lost.
+                    send({"type": "agent_start"})
+                    self.end("background complete", pending=False)
+                    self.settled = True
+                elif self.scenario == "settled-with-pending":
+                    # The background job finishes: native state goes positively
+                    # idle. The later all-idle snapshot is the completion proof.
+                    self.async_hint = None
+                    send({"type": "agent_start"})
+                    self.end("background complete", pending=False)
                 else:
                     send({"type": "agent_start"})
                     stop = {
@@ -517,7 +684,14 @@ class Peer:
                     self.result(settled=True)
                     self.settle()
             case "checkpoint":
-                self.respond(frame, {"pid": os.getpid(), "frames": self.frames})
+                self.respond(
+                    frame,
+                    {
+                        "pid": os.getpid(),
+                        "frames": self.frames,
+                        "snapshots": self.snapshot_responses,
+                    },
+                )
             case "abort":
                 if self.scenario != "stubborn":
                     self.respond(frame)
@@ -559,7 +733,9 @@ def main() -> None:
     parser.add_argument(
         "--child-stdio", choices=("inherit", "discard"), default="inherit"
     )
-    args = parser.parse_args()
+    # Adapter launches append real-OMP flags (--cwd=..., --approval-mode); the
+    # fake peer only cares about the scenario and the process gate.
+    args, _unknown = parser.parse_known_args()
     if args.scenario in {"gated-parent", "gated-child"}:
         if args.gate_port is None:
             raise ValueError("A process gate port is required")
