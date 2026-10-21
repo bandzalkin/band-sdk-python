@@ -6,6 +6,7 @@ import asyncio
 import collections.abc
 import json
 import logging
+import tempfile
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from pydantic import (
     Field,
     JsonValue,
     PositiveFloat,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -30,7 +32,8 @@ from band.converters.omp import OmpHistoryConverter, OmpSessionState
 from band.core import delivery, exceptions
 from band.core.adapterconfig import BaseAdapterConfig
 from band.core.delivery import DeliveryFailedError, reraise_delivery_cause
-from band.core.model_catalog import ModelSelection
+from band.core.exceptions import BandConfigError
+from band.core.model_catalog import ModelCatalog, ModelSelection
 from band.core.protocols import (
     FAILURE_CODE_TIMEOUT,
     GENERIC_PROVIDER_FAILURE_MESSAGE,
@@ -60,7 +63,13 @@ from band.integrations.omp import (
     omp_runtime_env,
     validate_omp_command,
 )
-from band.integrations.omprpc import OmpRpcClient, OmpRpcError
+from band.integrations.ompcatalog import (
+    OmpListingUnavailable,
+    OmpModelListing,
+    model_listing_command,
+    native_catalog,
+)
+from band.integrations.omprpc import OmpProcessError, OmpRpcClient, OmpRpcError
 from band.integrations.ompwire import (
     OmpContent,
     OmpEvent,
@@ -287,6 +296,65 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
 
     def _host_tools(self) -> list[dict[str, JsonValue]]:
         return self._host_schemas
+
+    async def probe_models(self, *, timeout_s: float = 60.0) -> ModelCatalog:
+        """Discover configured OMP models without a Band room or inference.
+
+        Try the native CLI JSON listing first, then a throwaway RPC connection.
+        Neither route proves provider authentication or inference entitlement.
+        Incomplete cleanup stays owned for ``cleanup_all`` or the next probe.
+        """
+        owner = self._harness_probe
+
+        async def discover() -> ModelCatalog:
+            listing: OmpModelListing | None = None
+            runtime: OmpRpcClient | None = None
+            directory: tempfile.TemporaryDirectory[str] | None = None
+
+            async def close() -> None:
+                errors: list[Exception] = []
+                if runtime is not None:
+                    try:
+                        await runtime.close()
+                    except Exception as error:  # noqa: BLE001 -- retain native failure while still closing the CLI transport
+                        errors.append(error)
+                if listing is not None:
+                    try:
+                        await listing.close()
+                    except Exception as error:  # noqa: BLE001 -- preserve every failed resource for the shared owner's retry
+                        errors.append(error)
+                if errors:
+                    raise ExceptionGroup("OMP catalog cleanup failed", errors)
+                if directory is not None:
+                    directory.cleanup()
+
+            owner.own(close)
+            try:
+                listing = OmpModelListing(
+                    model_listing_command(self.config.command),
+                    env=self._spawn_env(),
+                    cwd=self.config.cwd,
+                )
+                return await listing.read()
+            except OmpListingUnavailable:
+                # A failed/older CLI route is not evidence of an empty catalog.
+                if listing is not None:
+                    await listing.close()
+            directory = tempfile.TemporaryDirectory(prefix="band-omp-probe-")
+            workspace = self.config.cwd or directory.name
+            runtime = OmpRpcClient(
+                (*self._spawn_command(workspace), "--no-session"),
+                env=self._spawn_env(),
+            )
+            try:
+                await runtime.start()
+                return await native_catalog(runtime)
+            except (OmpProcessError, OmpRpcError, ValidationError, OSError):
+                raise BandConfigError(
+                    "OMP native model catalog is unavailable or invalid"
+                ) from None
+
+        return await owner.run(discover, timeout_s=timeout_s)
 
     def _build_host_tools(self) -> list[dict[str, JsonValue]]:
         definitions = list(
@@ -1065,7 +1133,16 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         return (self.on_cleanup(room_id) for room_id in rooms)
 
     async def cleanup_all(self) -> None:
-        await asyncio.gather(*self._cleanup_rooms())
+        results = await asyncio.gather(
+            super().cleanup_all(),
+            *self._cleanup_rooms(),
+            return_exceptions=True,
+        )
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("OMP adapter cleanup failed", errors)
 
 
 __all__ = [
