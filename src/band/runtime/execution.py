@@ -47,6 +47,7 @@ from band.client.streaming import (
     MessageCreatedPayload,
     MessageMetadata,
 )
+from band.core.activity import ToolNamesObserver
 from band.core.exceptions import (
     CleanupIncompleteError,
     InputNotAccepted,
@@ -431,6 +432,10 @@ class ExecutionContext:
         self._activity_owner: TurnScope | None = None
         self._activity_stop_scope: TurnScope | None = None
         self._activity_completion: asyncio.Task[None] | None = None
+        # Tool names follow the adapter's tool-narration choice; the default
+        # matches emit's opt-out semantics, so only adapters that drop
+        # Emit.TOOL_CALLS (via sync_activity_tool_names) hide them.
+        self._activity_tool_names = True
         self._control_revision = 0
         self._on_platform_stop = on_platform_stop
         self._shutdown_task: asyncio.Task[bool] | None = None
@@ -1945,11 +1950,22 @@ class ExecutionContext:
         self._activity_owner = scope
         await self._working_reporter.start()
 
+    def set_activity_tool_names(self, enabled: bool) -> None:
+        """Gate tool names in room activity to match tool-call narration.
+
+        Permission waits and memory activity are unaffected: they name no
+        content. The gate is consulted at report time, so an observer bound
+        before this change (a continuation's adapter pumping tool events while
+        the runner re-reads the choice) still follows the live choice.
+        """
+        self._activity_tool_names = enabled
+
     def activity_observer(self, scope: TurnScope | None) -> ActivityObserver | None:
-        return (
-            ScopeActivityObserver(self, scope)
-            if scope is not None and scope.activity_allowed
-            else None
+        if scope is None or not scope.activity_allowed:
+            return None
+        return ToolNamesObserver(
+            ScopeActivityObserver(self, scope),
+            hidden=lambda: not self._activity_tool_names,
         )
 
     def owns_activity(self, scope: TurnScope) -> bool:
