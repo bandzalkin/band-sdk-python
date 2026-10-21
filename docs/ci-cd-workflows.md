@@ -28,6 +28,20 @@ the workflow files cannot say for themselves.
   `python-core-coverage.yml` does not run in the queue. A break that shows only on a lane the
   queue skips reaches `main` and surfaces in the next PR's CI.
 
+## Private Core coverage
+
+- `python-core-coverage.yml` checks out the private Core repository with
+  `CORE_SDK_READ_KEY`. Fork pull requests and Dependabot cannot receive that secret,
+  so this job skips those contexts rather than attempting an unauthenticated checkout.
+- The ordinary CI test matrix still runs for fork pull requests. Core coverage runs
+  for trusted pull requests, merge groups, scheduled runs, and manual dispatches.
+- To validate a fork revision before merge, a maintainer can publish its reviewed
+  commit to a temporary upstream branch and run
+  `gh workflow run python-core-coverage.yml --repo band-ai/band-sdk-python --ref <branch>`.
+  Check that the run's head SHA matches the reviewed commit, wait for coverage and
+  reporting to finish, then remove only that temporary branch. The manual workflow
+  also posts its normal coverage digest; no secrets should be exposed to fork code.
+
 ## PyPI publish
 
 - **Trusted publishing binds to the top-level filename `band-publish.yml`** (with environment
