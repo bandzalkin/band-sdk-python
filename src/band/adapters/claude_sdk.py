@@ -59,9 +59,12 @@ try:
         PermissionResultDeny,
         SdkPluginConfig,
         SettingSource,
+        SystemPromptPreset,
         ThinkingConfigEnabled,
         ToolPermissionContext,
     )
+
+    from band.integrations.claude_sdk.transport import create_transport
 
     _CLAUDE_SDK_AVAILABLE = True
 except ImportError:
@@ -122,6 +125,11 @@ from band.core.types import (
     ToolEventKey,
     TurnUsage,
 )
+from band.integrations.claude_sdk.checks import (
+    close_host_probes,
+    preflight_result,
+    require_server_info,
+)
 from band.integrations.claude_sdk.dedup_tools import (
     DEFAULT_DEDUP_TTL_SECONDS,
     DedupingAgentTools,
@@ -168,6 +176,9 @@ from band.runtime.tools import (
     turn_effect,
 )
 from band.workspaces import RoomWorkspaces, WorkspaceResolver
+
+if TYPE_CHECKING:
+    from band.core.harness import PreflightResult
 
 logger = logging.getLogger(__name__)
 
@@ -737,6 +748,49 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         approvals = self.config.approvals
         return approvals.mode if approvals is not None else "disabled"
 
+    def _sdk_options(
+        self,
+        *,
+        system_prompt: str | SystemPromptPreset | None = None,
+        allowed_tools: list[str] | None = None,
+    ) -> ClaudeAgentOptions:
+        # Pin the room model under API-key auth; the CLI's default can send an
+        # obsolete thinking shape. Probes must use the same launch configuration.
+        options = ClaudeAgentOptions(
+            model=self.config.model or ANTHROPIC_MODEL,
+            fallback_model=self.config.fallback_model,
+            system_prompt=system_prompt,
+            allowed_tools=allowed_tools or [],
+            permission_mode=cast("PermissionMode", self.config.permission_mode),
+            effort=self.config.effort,
+            max_buffer_size=CLAUDE_SDK_MAX_BUFFER_BYTES,
+            setting_sources=list(self.config.setting_sources),
+            **self.config.cli.sdk_fields(),
+        )
+        if self.config.max_thinking_tokens:
+            options.thinking = self._thinking(self.config.max_thinking_tokens)
+        if self.config.cwd:
+            options.cwd = self.config.cwd
+        return options
+
+    async def _probe_server_info(self, *, timeout_s: float) -> dict[str, Any]:
+        async def initialize() -> dict[str, Any]:
+            options = self._sdk_options()
+            transport = create_transport(options)
+            self._harness_probe.own(transport.close)
+            client = ClaudeSDKClient(options=options, transport=transport)
+            # Client disconnect alone cannot close a transport whose startup
+            # failed before the SDK created its query.
+            self._harness_probe.own(client.disconnect)
+            await client.connect()
+            return require_server_info(await client.get_server_info())
+
+        return await self._harness_probe.run(initialize, timeout_s=timeout_s)
+
+    async def preflight(self, *, timeout_s: float = 60.0) -> PreflightResult:
+        """Handshake the configured Claude CLI without a room or inference."""
+        return await preflight_result(self._probe_server_info(timeout_s=timeout_s))
+
     # --- Adapted from BandClaudeSDKAgent._on_started ---
     async def on_started(self, agent_name: str, agent_description: str) -> None:
         """Create MCP server and session manager after agent metadata is fetched."""
@@ -757,40 +811,10 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
             features=self.features,
         )
 
-        # Always pin a model: the `claude` CLI's own pick sends the legacy
-        # `thinking.type.enabled` shape under API-key auth, which current
-        # models reject, so the run errors with no output.
-        resolved_model = self.config.model or ANTHROPIC_MODEL
-        sdk_options = ClaudeAgentOptions(
-            model=resolved_model,
-            fallback_model=self.config.fallback_model,
+        sdk_options = self._sdk_options(
             system_prompt=system_prompt,
             allowed_tools=[*mcp_backend.allowed_tools, TOOL_SEARCH],
-            # Same values as the SDK's PermissionMode (pinned by tests/adapters/claude_sdk/test_config.py).
-            permission_mode=cast("PermissionMode", self.config.permission_mode),
-            effort=self.config.effort,
-            max_buffer_size=CLAUDE_SDK_MAX_BUFFER_BYTES,
-            # Isolate the bridged agent from ambient Claude Code config (default []).
-            # Left at the SDK default, setting_sources loads the host's user + project
-            # settings (~/.claude and ./.claude): filesystem skills and subagents then
-            # surface as `Skill`/`Agent` tools, and the enlarged toolset trips
-            # ToolSearch, which withholds tool definitions (including our `mcp__band__*`
-            # tools) behind a search step — so on a CI runner with a global Claude Code
-            # install the model wandered through ToolSearch/Bash/Agent/Skill instead of
-            # calling the Band tool. Loading no host config keeps the tool set lean, so
-            # ToolSearch does not engage and the Band tools stay directly in context.
-            # Configurable via the config for callers who want their host config.
-            setting_sources=list(self.config.setting_sources),
-            **self.config.cli.sdk_fields(),
         )
-
-        # Add extended thinking if configured
-        if self.config.max_thinking_tokens:
-            sdk_options.thinking = self._thinking(self.config.max_thinking_tokens)
-
-        # Set working directory if configured
-        if self.config.cwd:
-            sdk_options.cwd = self.config.cwd
 
         # When approvals are set, add a PreToolUse hook that returns
         # "ask" for native tools so the SDK delegates to can_use_tool instead
@@ -824,7 +848,7 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         logger.info(
             "Claude SDK adapter started for agent: %s (model=%s, fallback_model=%s, thinking=%s, effort=%s, approval=%s)",
             agent_name,
-            resolved_model,
+            sdk_options.model,
             self.config.fallback_model or "none",
             self.config.max_thinking_tokens,
             self.config.effort or "default",
@@ -1701,6 +1725,7 @@ class ClaudeSDKAdapter(ApprovalInterruptMixin, SimpleAdapter[ClaudeSDKSessionSta
         self._turn_release.pop(room_id, None)
         logger.debug("Room %s: Cleaned up Claude SDK session", room_id)
 
+    @close_host_probes
     async def cleanup_all(self) -> None:
         """Own the complete session-then-MCP shutdown under one reporting budget.
 
