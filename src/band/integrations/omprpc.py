@@ -760,6 +760,11 @@ class OmpRpcClient:
         request_id: str,
         callback: Coroutine[object, object, None],
     ) -> None:
+        if self._closing:
+            # Cleanup already collected the callbacks it will cancel; a later one
+            # could otherwise post after its room's turn has ended.
+            callback.close()
+            return
         key = (kind, request_id)
         task = asyncio.create_task(callback)
         if key in turn.callbacks:
