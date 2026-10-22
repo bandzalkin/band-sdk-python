@@ -23,9 +23,9 @@ replay workflow). Nothing else.
 `N after M` marks N as stacked on M: while M is open, only N's own changes on top of
 M's head are applied.
 
-Shared shutdown repair #909 is the prerequisite of the native OMP stack.
-Every native layer lists its immediate predecessor with `after`, so the shared
-repair and each native delta are applied exactly once.
+Shared shutdown repair #909 is part of upstream `main`. The native OMP stack
+starts at #897; each subsequent native layer lists its immediate predecessor
+with `after`, so every native delta is applied exactly once.
 
 The [manifest](.github/band-agent/prs.txt) is the source of truth for the selected
 pull requests and their ordering.
