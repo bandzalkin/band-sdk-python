@@ -23,31 +23,13 @@ replay workflow). Nothing else.
 `N after M` marks N as stacked on M: while M is open, only N's own changes on top of
 M's head are applied.
 
-The selection includes native OMP room asks (#795) and the refreshed host APIs
-(#843–#852), alongside the existing backlog, native OMP and room-scoped MCP fixes.
-Host status (#849) follows disconnect reporting (#843). Shared probe contracts
-(#844) precede the backend preflights and catalogs; Claude and Codex catalogs
-(#851/#852) follow their preflights (#847/#846).
+Shared shutdown repair #909 is the prerequisite of the native OMP stack.
+Every native layer lists its immediate predecessor with `after`, so the shared
+repair and each native delta are applied exactly once.
 
-Room-scoped MCP startup is maintained in fork-backed upstream pull requests:
-Copilot/ACP #853 replaces #799, native OMP #854 replaces #798, Codex #855
-replaces #797, and Claude #856 replaces #800. Native OMP follows #763; Claude
-follows #855. All corrections stay in those source branches, not in generated
-SDK commits.
-Backlog recovery #857 likewise replaces #730; its source branch was rebased
-onto current `main` on 2026-10-20 after the test reorg moved its files.
-Every selected upstream pull request is maintained from this fork.
+The [manifest](.github/band-agent/prs.txt) is the source of truth for the selected
+pull requests and their ordering.
 
-The typed agent activity stack (Band's INT-1744) is carried through #841,
-whose branch inherits the merged #839 and the #840 delivery work, with our
-#874 stacked after #841: it gates tool names in the activity detail on the
-adapter's tool-narration choice, pending the producers adopting the same
-rule. Because #763 deletes `omp_acp.py` while #841 edits it, #763 lists
-`after 874` so its removal composes once; the native OMP activity hooks
-(tool and permission) land on #763's own branch.
-
-Native OMP catalogs (#848) use `after 763`: their branch inherits the native
-adapter and transplanted copies of #844's shared changes, not #844's head.
 Identical shared, Windows Job and ACP cleanup corrections carried by multiple
 selected pull requests must compose once in the resulting tree. Any disagreement
 is corrected in the owning upstream pull request, not with a fork patch.
