@@ -74,6 +74,7 @@ from band.integrations.ompwire import (
     OmpUIRequest,
     OmpUIResponse,
 )
+from band.runtime.activity import set_permission_wait
 from band.runtime.custom_tools import (
     CustomToolDef,
     custom_tools_to_schemas,
@@ -86,6 +87,7 @@ from band.runtime.prompts import (
     TURN_COMPLETION_GUIDANCE,
     render_system_prompt,
 )
+from band.runtime.toolactivity import end_tool_activity, report_tool_activity
 from band.runtime.tools import (
     BAND_MCP_SERVER_NAME,
     get_band_tool_category,
@@ -174,6 +176,7 @@ class OmpTurn:
     tools: AgentToolsProtocol
     calls: dict[str, tuple[str, dict[str, JsonValue]]] = field(default_factory=dict)
     closing_text: list[str] = field(default_factory=list)
+    pending_permission_waits: int = 0
 
 
 @dataclass
@@ -609,7 +612,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                         if request.method == "ask":
                             return await self._ask_room(request, msg, tools, room_id)
                         return await self._permission(
-                            request, room_id, room.session_id, tools
+                            request, room_id, room.session_id, turn
                         )
 
                     await room.runtime.prompt(
@@ -862,21 +865,28 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
         request: OmpUIRequest,
         room_id: str,
         session_id: str,
-        tools: AgentToolsProtocol,
+        turn: OmpTurn,
     ) -> OmpUIResponse:
         if request.method != "select":
             return OmpUIResponse(cancelled=True)
+        tools = turn.tools
         options = tuple(request.options or ())
         choice = None
         if self._resolve_permission is not None:
-            choice = await self._resolve_permission(
-                OmpPermissionRequest(
-                    room_id=room_id,
-                    session_id=session_id,
-                    title=request.title or "",
-                    options=options,
+            turn.pending_permission_waits += 1
+            try:
+                await set_permission_wait(tools, True)
+                choice = await self._resolve_permission(
+                    OmpPermissionRequest(
+                        room_id=room_id,
+                        session_id=session_id,
+                        title=request.title or "",
+                        options=options,
+                    )
                 )
-            )
+            finally:
+                turn.pending_permission_waits -= 1
+                await set_permission_wait(tools, bool(turn.pending_permission_waits))
         elif options == ("Approve", "Deny"):
             choice = "Approve"
         response = (
@@ -950,6 +960,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                 )
                 turn.calls[event.toolCallId] = (name, arguments)
                 if Emit.TOOL_CALLS in self.features.emit:
+                    await report_tool_activity(turn.tools, name)
                     await send_event_safe(
                         turn.tools,
                         self._encode_tool_call(name, arguments, event.toolCallId),
@@ -960,6 +971,12 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                 if call is None:
                     return
                 name, _arguments = call
+                if Emit.TOOL_CALLS in self.features.emit:
+                    if turn.calls:
+                        remaining_name = next(reversed(turn.calls.values()))[0]
+                        await report_tool_activity(turn.tools, remaining_name)
+                    else:
+                        await end_tool_activity(turn.tools)
                 if not self.config.inject_band_tools and not event.isError:
                     turn.tools.turn.record(turn_effect(name))
                 if Emit.TOOL_CALLS in self.features.emit:
