@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from band.adapters.omp import OmpAdapter, OmpAdapterConfig
+from tests.adapters.omp.kit import RefreshClients
 from tests.adapters.omp.selectionkit import (
     MODEL_PROVIDER,
     ORIGINAL_MODEL,
@@ -68,3 +69,10 @@ def ask_adapter(tmp_path: Path):
         emit=(),
     )
     return adapter
+
+
+@pytest.fixture
+def refresh_clients(monkeypatch: pytest.MonkeyPatch) -> RefreshClients:
+    clients = RefreshClients()
+    monkeypatch.setattr("band.adapters.omp.OmpRpcClient", clients)
+    return clients
