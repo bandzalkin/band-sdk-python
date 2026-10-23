@@ -63,7 +63,7 @@ from band.core.types import (
     PlatformMessage,
     ToolEventKey,
 )
-from band.integrations import omproomask
+from band.integrations import omproomask, omprpc
 from band.integrations.omp import (
     OMP_APPROVAL_MODE_ALWAYS_ASK,
     OMP_DEVICE_CONTENT_KEY,
@@ -909,7 +909,16 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                         prompt, on_event=on_event, on_tool=on_tool, on_ui=on_ui
                     )
                     room.bootstrapped = True
-                    await self._refresh_state(room)
+                    # The post-prompt state refresh is part of completion: a
+                    # lost response must fail bounded, not outlive the turn.
+                    try:
+                        async with asyncio.timeout(room.runtime.completion_timeout_s):
+                            await self._refresh_state(room)
+                    except TimeoutError as cause:
+                        raise omprpc.OmpCompletionTimeout(
+                            "OMP post-turn state refresh timed out;"
+                            " the turn outcome is uncertain"
+                        ) from cause
                     closing = "\n\n".join(turn.closing_text)
                     if (
                         Emit.THOUGHTS in self.features.emit
@@ -934,7 +943,7 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                     await self._retire_room(room_id)
                 finally:
                     reraise_delivery_cause(error)
-            except Exception:
+            except Exception as error:
                 active.ending = True
                 if deadline.expired():
                     logger.error(
@@ -958,7 +967,12 @@ class OmpAdapter(SimpleAdapter[OmpSessionState]):
                         )
                         await tools.send_failure(failure)
                 finally:
-                    await self._retire_room(room_id)
+                    try:
+                        await self._retire_room(room_id)
+                    except omprpc.OmpProcessError:
+                        if isinstance(error, omprpc.OmpCompletionTimeout):
+                            raise error  # noqa: TRY201 -- preserve completion over cleanup failure
+                        raise
                 raise
             finally:
                 if self._owners.get(room_id) is active:
